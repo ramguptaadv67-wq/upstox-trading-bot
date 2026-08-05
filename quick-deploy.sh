@@ -5,6 +5,10 @@ echo "=== Upstox Bot Fresh Deploy ==="
 APP_DIR="/var/www/upstox-bot"
 REPO_URL="https://github.com/ramguptaadv67-wq/upstox-trading-bot.git"
 
+# MUST cd to /root FIRST — we're about to delete /var/www/upstox-bot
+# and if CWD is inside it, git clone will fail
+cd /root || cd /tmp
+
 # 1. Stop PM2
 echo "[1/8] Stopping PM2..."
 pm2 delete upstox-bot 2>/dev/null || true
@@ -15,7 +19,7 @@ if [ -f "$APP_DIR/data.db" ]; then
   cp "$APP_DIR/data.db" /tmp/data.db.bak
   echo "  Database backed up to /tmp/data.db.bak"
 else
-  echo "  No existing database found — starting fresh"
+  echo "  No existing database — starting fresh"
 fi
 
 # 3. Remove old files
@@ -23,7 +27,7 @@ echo "[3/8] Removing old files..."
 rm -rf "$APP_DIR"
 rm -rf /tmp/upstox-new
 
-# 4. Clone fresh repo
+# 4. Clone fresh repo (we're in /root now, not in the deleted dir)
 echo "[4/8] Cloning fresh repo..."
 git clone "$REPO_URL" /tmp/upstox-new
 
@@ -37,7 +41,7 @@ if [ -f /tmp/data.db.bak ]; then
   echo "[6/8] Restoring database..."
   cp /tmp/data.db.bak "$APP_DIR/data.db"
 else
-  echo "[6/8] No backup to restore — starting fresh"
+  echo "[6/8] No backup — starting with fresh database"
 fi
 
 # 7. Install dependencies
@@ -76,9 +80,6 @@ echo ""
 echo "--- /health ---"
 curl -s http://127.0.0.1:3000/health
 echo ""
-echo ""
-echo "--- Dashboard JS check ---"
-curl -s http://127.0.0.1:3000/ | grep -c "catch" && echo "Dashboard JS has catch blocks (OK)" || echo "WARNING: Dashboard JS might be broken"
 echo ""
 echo "=== DEPLOY COMPLETE ==="
 echo ""

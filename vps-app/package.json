@@ -1,0 +1,17 @@
+{
+  "name": "upstox-trading-bot",
+  "version": "1.0.0",
+  "description": "Upstox trading bot with dashboard, exit engine, and webhook receiver",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.0",
+    "better-sqlite3": "^11.0.0",
+    "node-fetch": "^2.7.0",
+    "ws": "^8.16.0",
+    "protobufjs": "^7.2.5"
+  }
+}

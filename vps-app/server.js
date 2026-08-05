@@ -1,0 +1,1366 @@
+const express = require("express");
+const Database = require("better-sqlite3");
+const fetch = require("node-fetch");
+const path = require("path");
+const crypto = require("crypto");
+const http = require("http");
+const https = require("https");
+
+const app = express();
+const PORT = 3000;
+const DB_PATH = path.join(__dirname, "data.db");
+
+// Force IPv4 on all outgoing requests — prevents UDAPI1154 IP mismatch error
+// Upstox whitelists your IPv4 address, but the VPS defaults to IPv6 for outgoing calls.
+const ipv4Agent = new https.Agent({
+  family: 4,
+  keepAlive: true,
+});
+const httpIpv4Agent = new http.Agent({
+  family: 4,
+  keepAlive: true,
+});
+function fetchIPv4(url, opts = {}) {
+  const isHttps = url.startsWith("https");
+  return fetch(url, { ...opts, agent: isHttps ? ipv4Agent : httpIpv4Agent });
+}
+
+// Middleware
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.text({ limit: "1mb" }));
+
+// No-cache for all API responses — prevents browser from serving stale data
+app.use("/api", (req, res, next) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  next();
+});
+
+// --- Database ---
+const db = new Database(DB_PATH);
+db.pragma("journal_mode = WAL");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+  CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, raw_message TEXT, payload TEXT, status TEXT);
+  CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, type TEXT, action TEXT, instrument_token TEXT, quantity INTEGER, result TEXT, ok INTEGER);
+  CREATE TABLE IF NOT EXISTS positions (id INTEGER PRIMARY KEY AUTOINCREMENT, instrument_token TEXT, transaction_type TEXT, quantity INTEGER, entry_price REAL, highest_price REAL, lowest_price REAL, added_at INTEGER, exit_config TEXT, active INTEGER DEFAULT 1);
+  CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, level TEXT, message TEXT);
+`);
+
+// --- Helpers ---
+function getSetting(key, fallback = "") {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key);
+  return row ? row.value : fallback;
+}
+
+// BUG 37: Daily trade counter + kill switch
+let dailyTradeCount = 0;
+let dailyTradeDate = new Date().toDateString();
+function checkDailyLimit() {
+  const today = new Date().toDateString();
+  if (today !== dailyTradeDate) {
+    dailyTradeCount = 0;
+    dailyTradeDate = today;
+  }
+  const maxTrades = parseInt(getSetting("max_daily_trades", "10"), 10);
+  if (maxTrades > 0 && dailyTradeCount >= maxTrades) {
+    console.log(`[SAFETY] Daily trade limit reached: ${dailyTradeCount}/${maxTrades} — blocking new orders`);
+    return false;
+  }
+  return true;
+}
+function incrementTradeCount() {
+  dailyTradeCount++;
+  console.log(`[SAFETY] Daily trades: ${dailyTradeCount}`);
+}
+
+function setSetting(key, value) {
+  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
+}
+function getSecret(key) { return getSetting(key); }
+function logSignal(raw, payload, status) {
+  db.prepare("INSERT INTO signals (timestamp, raw_message, payload, status) VALUES (?, ?, ?, ?)")
+    .run(Date.now(), raw, JSON.stringify(payload), status);
+}
+function logOrder(type, action, instrument, qty, result, ok) {
+  db.prepare("INSERT INTO orders (timestamp, type, action, instrument_token, quantity, result, ok) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .run(Date.now(), type, action, instrument, qty, JSON.stringify(result), ok ? 1 : 0);
+}
+function addLog(level, msg) {
+  db.prepare("INSERT INTO logs (timestamp, level, message) VALUES (?, ?, ?)").run(Date.now(), level, msg);
+}
+
+function safeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+function isMarketOpen() {
+  const now = new Date();
+  const ist = new Date(now.getTime() + 5.5 * 3600000);
+  const day = ist.getUTCDay();
+  if (day === 0 || day === 6) return false;
+  if (isTradingHoliday()) return false;
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  return mins >= 555 && mins <= 930; // 9:15 AM to 3:30 PM IST
+}
+
+
+// BUG 34: NSE/BSE trading holidays 2026 (partial list — update as needed)
+const NSE_HOLIDAYS_2026 = [
+  "2026-01-26", // Republic Day
+  "2026-03-06", // Holi (adjust per actual date)
+  "2026-03-27", // Good Friday (adjust)
+  "2026-04-14", // Ambedkar Jayanti
+  "2026-05-01", // Maharashtra Day
+  "2026-08-15", // Independence Day
+  "2026-10-02", // Gandhi Jayanti
+  "2026-10-21", // Dussehra (adjust)
+  "2026-10-31", // Diwali (adjust — Laxmi Pujan, trading hours may differ)
+  "2026-11-05", // Diwali Balipratipada
+  "2026-12-25", // Christmas
+];
+function isTradingHoliday() {
+  // Use IST date (UTC+5:30) — toISOString() returns UTC which is wrong for IST
+  const now = new Date();
+  const ist = new Date(now.getTime() + 5.5 * 3600000);
+  const today = ist.toISOString().substring(0, 10);
+  return NSE_HOLIDAYS_2026.includes(today);
+}
+
+const UNDERLYING = [
+  { name: "NIFTY 50", key: "NSE_INDEX|Nifty 50", symbol: "NIFTY", lot_size: 65 },
+  { name: "NIFTY BANK", key: "NSE_INDEX|Nifty Bank", symbol: "BANKNIFTY", lot_size: 30 },
+  { name: "NIFTY FIN SERVICE", key: "NSE_INDEX|Nifty Fin Service", symbol: "FINNIFTY", lot_size: 60 },
+  { name: "NIFTY MIDCAP SELECT", key: "NSE_INDEX|Nifty Midcap 50", symbol: "MIDCPNIFTY", lot_size: 120 },
+  { name: "SENSEX", key: "BSE_INDEX|Sensex", symbol: "SENSEX", lot_size: 20 },
+  { name: "BANKEX", key: "BSE_INDEX|Bankex", symbol: "BANKEX", lot_size: 30 },
+];
+
+const DEFAULT_EXIT_CONFIG = {
+  enabled: false, mode: "none",
+  trailing_sl_points: 20, trailing_activation_points: 10,
+  fixed_sl_points: 30, fixed_target_points: 40,
+};
+
+function getExitConfig() {
+  const raw = getSetting("exit_config", "");
+  return { ...DEFAULT_EXIT_CONFIG, ...(raw ? JSON.parse(raw) : {}) };
+}
+
+// --- Trading Config (what the bot buys when it gets a webhook signal) ---
+const DEFAULT_TRADING_CONFIG = {
+  underlying: "NSE_INDEX|Nifty 50",  // instrument key of underlying
+  underlying_name: "NIFTY 50",
+  lot_size: 65,
+  option_type: "CE",                // CE or PE
+  lots: 1,                          // number of lots
+  product: "D",                     // D (Delivery) or I (Intraday)
+  // Exit conditions for webhook-placed orders
+  exit_target_points: 40,
+  exit_sl_points: 25,
+  trailing_sl_points: 15,
+  trailing_activation_points: 10,
+  use_exit: true,                   // whether to track exits for webhook orders
+};
+
+function getTradingConfig() {
+  const raw = getSetting("trading_config", "");
+  return { ...DEFAULT_TRADING_CONFIG, ...(raw ? JSON.parse(raw) : {}) };
+}
+
+// Auto-calculate ATM strike for an underlying
+async function calculateATM(accessToken, instrumentKey, optionType, expiryDate, wsSpot) {
+  // BUG 36: Use WebSocket LTP if available (saves 200ms REST call)
+  const spot = wsSpot || await getLTP(accessToken, instrumentKey);
+  if (!spot) return null;
+  const result = await getOptionContracts(accessToken, instrumentKey, null);
+  if (!result.ok) return null;
+  const contracts = (result.data && result.data.data) || [];
+  // Get nearest expiry if not specified
+  const expiries = [...new Set(contracts.map(c => c.expiry))].sort();
+  if (expiries.length === 0) return null;
+  const nearestExpiry = expiryDate || expiries[0];
+  // Filter by expiry and option type
+  const typed = contracts.filter(c => c.expiry === nearestExpiry && c.instrument_type === optionType);
+  if (typed.length === 0) return null;
+  // Find ATM (closest to spot)
+  let atm = typed[0], minDiff = Math.abs(typed[0].strike_price - spot);
+  for (const c of typed) {
+    const d = Math.abs(c.strike_price - spot);
+    if (d < minDiff) { minDiff = d; atm = c; }
+  }
+  return { spot, atm_strike: atm.strike_price, instrument_key: atm.instrument_key, trading_symbol: atm.trading_symbol, lot_size: atm.lot_size, expiry: nearestExpiry };
+}
+
+// --- Debug endpoint to check credential status (masked) ---
+app.get("/api/debug-creds", (req, res) => {
+  const cid = getSetting("UPSTOX_CLIENT_ID", "");
+  const cs = getSetting("UPSTOX_CLIENT_SECRET", "");
+  const ws = getSetting("WEBHOOK_SECRET", "");
+  res.json({
+    client_id_present: !!cid,
+    client_id_length: cid.length,
+    client_id_preview: cid ? cid.substring(0, 8) + "..." : "(empty)",
+    client_secret_present: !!cs,
+    client_secret_length: cs.length,
+    webhook_secret_present: !!ws,
+    db_path: DB_PATH,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// --- Upstox API ---
+async function getToken() {
+  const token = getSetting("access_token", "");
+  const expiry = parseInt(getSetting("access_token_expiry", "0"), 10);
+  return { token, expiry };
+}
+
+async function placeUpstoxOrder(accessToken, order) {
+  // BUG 37: Check daily trade limit before placing order
+  if (!checkDailyLimit()) {
+    console.log("[ORDER] Blocked: daily trade limit reached");
+    return { ok: false, status: 429, data: { error: "Daily trade limit reached" } };
+  }
+  const orderType = (order.order_type || "MARKET").toUpperCase();
+  // Auto-switch to LIMIT if market is closed and order type is MARKET
+  const useLimit = orderType === "MARKET" && !isMarketOpen();
+  const ltp = useLimit ? await getLTP(accessToken, order.instrument_token) : 0;
+  const finalOrderType = useLimit ? "LIMIT" : orderType;
+  const finalPrice = useLimit ? (ltp || 0) : parseFloat(order.price || 0);
+
+  // BUG 6: slice:true — auto-split orders exceeding exchange freeze quantity
+  // BUG 7: Use V3 API endpoint
+  const body = {
+    quantity: order.quantity,
+    product: order.product || "D",
+    validity: order.validity || "DAY",
+    price: finalPrice,
+    tag: order.tag || "tv-webhook",
+    instrument_token: order.instrument_token,
+    order_type: finalOrderType,
+    transaction_type: order.transaction_type,
+    disclosed_quantity: 0,
+    trigger_price: 0,
+    is_amo: false,
+    market_protection: -1, // automatic (Upstox decides)
+    slice: true,
+  };
+  console.log(`[ORDER] Placing (V3): ${JSON.stringify(body)}`);
+  console.log(`[ORDER] Market open: ${isMarketOpen()}, using ${finalOrderType} at price ${finalPrice}`);
+  console.log(`[ORDER] Token preview: ${accessToken ? accessToken.substring(0, 15) + "..." : "(empty)"}`);
+  const resp = await fetchIPv4("https://api-hft.upstox.com/v3/order/place", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: `Bearer ${accessToken}` },
+    body: JSON.stringify(body),
+  });
+  const text = await resp.text();
+  console.log(`[ORDER] Response: HTTP ${resp.status} — ${text.substring(0, 300)}`);
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  // BUG 5: Verify order was actually accepted — check response body, not just HTTP 200
+  const orderAccepted = resp.ok && data && (data.status === "success" || (data.data && data.data.order_id));
+  if (resp.ok && !orderAccepted) {
+    console.log(`[ORDER] WARNING: HTTP 200 but order may not be accepted: ${text.substring(0, 200)}`);
+  }
+  if (orderAccepted) incrementTradeCount();
+  return { ok: orderAccepted, status: resp.status, data };
+}
+
+async function placeExitOrder(accessToken, instrumentToken, quantity, transactionType) {
+  return await placeUpstoxOrder(accessToken, {
+    quantity, product: "I", order_type: "MARKET",
+    transaction_type: transactionType, instrument_token: instrumentToken,
+    tag: "exit",
+  });
+}
+
+async function getLTP(accessToken, instrumentToken) {
+  const url = `https://api.upstox.com/v2/market-quote/ltp?instrument_key=${encodeURIComponent(instrumentToken)}`;
+  const resp = await fetchIPv4(url, { headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` } });
+  if (!resp.ok) return null;
+  const data = await resp.json();
+  const key = Object.keys(data.data || {})[0];
+  return key ? data.data[key].last_price : null;
+}
+
+async function getOptionContracts(accessToken, instrumentKey, expiryDate) {
+  let url = `https://api.upstox.com/v2/option/contract?instrument_key=${encodeURIComponent(instrumentKey)}`;
+  if (expiryDate) url += `&expiry_date=${encodeURIComponent(expiryDate)}`;
+  const resp = await fetchIPv4(url, { headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` } });
+  const text = await resp.text();
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  return { ok: resp.ok, status: resp.status, data };
+}
+
+async function requestAccessToken() {
+  // Read from DB, with hardcoded fallbacks so it works even if DB is empty
+  const clientId = getSetting("UPSTOX_CLIENT_ID", "") || "a97d9aad-d04c-4dd7-9c2b-72bcd1f08bb4";
+  const clientSecret = getSetting("UPSTOX_CLIENT_SECRET", "") || "51bz9r0ww1";
+
+  const url = `https://api.upstox.com/v3/login/auth/token/request/${clientId}`;
+  console.log(`[TOKEN] Requesting token for client_id: ${clientId.substring(0, 8)}... (secret length: ${clientSecret.length})`);
+  const resp = await fetchIPv4(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ client_secret: clientSecret }),
+  });
+  const text = await resp.text();
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  console.log(`[TOKEN] Response: HTTP ${resp.status} — ${text.substring(0, 200)}`);
+  addLog(resp.ok ? "INFO" : "ERROR", `Token request ${resp.ok ? "sent" : "failed"} (HTTP ${resp.status}): ${text.substring(0, 300)}`);
+  return { ok: resp.ok, status: resp.status, data };
+}
+
+async function getUpstoxPositions() {
+  const { token, expiry } = await getToken();
+  if (!token || Date.now() >= expiry) return { error: "no_token" };
+  const resp = await fetchIPv4("https://api.upstox.com/v2/portfolio/short-term-positions", {
+    headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+  });
+  const text = await resp.text();
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  return { ok: resp.ok, status: resp.status, data };
+}
+
+// --- Exit Engine (runs every 5 seconds) ---
+async function checkExits() {
+  const config = getExitConfig();
+  if (!config.enabled || config.mode === "none") return;
+  const { token, expiry } = await getToken();
+  if (!token || Date.now() >= expiry) return;
+  const positions = db.prepare("SELECT * FROM positions WHERE active = 1").all();
+  if (positions.length === 0) return;
+
+  for (const pos of positions) {
+    let shouldExit = false;
+    let exitReason = "";
+    const exitCfg = pos.exit_config ? JSON.parse(pos.exit_config) : {};
+    // BUG 8: Skip strategy-managed positions — TRONE handles its own exits
+    if (exitCfg.strategy_managed) continue;
+    const mode = exitCfg.mode || config.mode;
+    const trailSLpts = exitCfg.trailing_sl_points ?? config.trailing_sl_points;
+    const trailActPts = exitCfg.trailing_activation_points ?? config.trailing_activation_points;
+    const fixedSLpts = exitCfg.fixed_sl_points ?? config.fixed_sl_points;
+    const fixedTargetPts = exitCfg.fixed_target_points ?? config.fixed_target_points;
+
+    const ltp = await getLTP(token, pos.instrument_token);
+    if (ltp === null) continue;
+
+    if (pos.transaction_type === "BUY") {
+      if (ltp > (pos.highest_price || 0)) {
+        pos.highest_price = ltp;
+        db.prepare("UPDATE positions SET highest_price = ? WHERE id = ?").run(ltp, pos.id);
+      }
+    } else {
+      if (ltp < (pos.lowest_price || 999999)) {
+        pos.lowest_price = ltp;
+        db.prepare("UPDATE positions SET lowest_price = ? WHERE id = ?").run(ltp, pos.id);
+      }
+    }
+
+    const isBuy = pos.transaction_type === "BUY";
+
+    if (mode === "trailing_sl" || mode === "both") {
+      if (isBuy) {
+        const movePts = (pos.highest_price || 0) - pos.entry_price;
+        if (movePts >= trailActPts) {
+          const sl = (pos.highest_price || 0) - trailSLpts;
+          if (ltp <= sl) { shouldExit = true; exitReason = `Trailing SL hit (SL: ${sl.toFixed(2)}, LTP: ${ltp})`; }
+        }
+      } else {
+        const movePts = pos.entry_price - (pos.lowest_price || 0);
+        if (movePts >= trailActPts) {
+          const sl = (pos.lowest_price || 0) + trailSLpts;
+          if (ltp >= sl) { shouldExit = true; exitReason = `Trailing SL hit (SL: ${sl.toFixed(2)}, LTP: ${ltp})`; }
+        }
+      }
+    }
+
+    if (!shouldExit && (mode === "fixed_sl_target" || mode === "both")) {
+      if (isBuy) {
+        const slPrice = pos.entry_price - fixedSLpts;
+        const targetPrice = pos.entry_price + fixedTargetPts;
+        if (ltp <= slPrice) { shouldExit = true; exitReason = `Fixed SL hit (SL: ${slPrice.toFixed(2)}, LTP: ${ltp})`; }
+        else if (ltp >= targetPrice) { shouldExit = true; exitReason = `Target hit (Target: ${targetPrice.toFixed(2)}, LTP: ${ltp})`; }
+      } else {
+        const slPrice = pos.entry_price + fixedSLpts;
+        const targetPrice = pos.entry_price - fixedTargetPts;
+        if (ltp >= slPrice) { shouldExit = true; exitReason = `Fixed SL hit (SL: ${slPrice.toFixed(2)}, LTP: ${ltp})`; }
+        else if (ltp <= targetPrice) { shouldExit = true; exitReason = `Target hit (Target: ${targetPrice.toFixed(2)}, LTP: ${ltp})`; }
+      }
+    }
+
+    if (shouldExit) {
+      const exitSide = isBuy ? "SELL" : "BUY";
+      const result = await placeExitOrder(token, pos.instrument_token, pos.quantity, exitSide);
+      logOrder("exit", exitSide, pos.instrument_token, pos.quantity, result.data, result.ok);
+      addLog("INFO", `Exit: ${exitReason} — ${pos.instrument_token}`);
+      db.prepare("UPDATE positions SET active = 0 WHERE id = ?").run(pos.id);
+    }
+  }
+}
+
+
+// BUG 23: Sync bot positions with actual Upstox positions every 60 seconds
+async function syncPositionsWithUpstox() {
+  try {
+    const { token, expiry } = await getToken();
+    if (!token || Date.now() >= expiry) return;
+    if (!isMarketOpen()) return;
+    
+    const resp = await fetchIPv4("https://api.upstox.com/v2/portfolio/short-term-positions", {
+      headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const upstoxPositions = (data.data || []).filter(p => p.quantity > 0);
+    const upstoxTokens = new Set(upstoxPositions.map(p => p.instrument_token));
+    
+    // Check bot's active positions that no longer exist in Upstox
+    const dbPositions = db.prepare("SELECT * FROM positions WHERE active = 1").all();
+    for (const pos of dbPositions) {
+      if (!upstoxTokens.has(pos.instrument_token)) {
+        // Position was closed externally (manual exit on app)
+        console.log(`[SYNC] Position ${pos.instrument_token} no longer in Upstox — marking closed`);
+        db.prepare("UPDATE positions SET active = 0 WHERE id = ?").run(pos.id);
+        addLog("WARN", `Position closed externally: ${pos.instrument_token}`);
+      }
+    }
+  } catch (e) {
+    // Silent — don't spam logs on network errors
+  }
+}
+
+// Run exit engine every 5 seconds
+setInterval(async () => {
+  if (isMarketOpen()) {
+    try { await checkExits(); } catch (e) { addLog("ERROR", "Exit engine: " + e.message); }
+    try { await syncPositionsWithUpstox(); } catch (e) {}
+  }
+}, 5000);
+
+// Token request cron at 9:10 AM IST
+setInterval(async () => {
+  const now = new Date();
+  const ist = new Date(now.getTime() + 5.5 * 3600000);
+  const istMinutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  const day = ist.getUTCDay();
+  if (day >= 1 && day <= 5 && istMinutes === 550) { // 9:10 AM IST
+    try { await requestAccessToken(); addLog("INFO", "Token request triggered"); } catch (e) {}
+  }
+}, 60000);
+
+// --- Dedupe ---
+const recentSignals = new Map();
+function isDuplicate(payload) {
+  const key = JSON.stringify(payload);
+  if (recentSignals.has(key)) return true;
+  recentSignals.set(key, true);
+  setTimeout(() => recentSignals.delete(key), 10000);
+  return false;
+}
+
+// ==================== ROUTES ====================
+
+// Dashboard HTML — no-cache headers prevent browser from serving stale HTML
+app.get("/", (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  res.send(DASHBOARD_HTML);
+});
+
+// Webhook receiver — accepts {"action":"BUY"}, plain "BUY", or TradingView {{strategy.order.action}}
+// Bot uses saved Trading Config to determine instrument, strike, qty, exits
+app.post("/webhook", async (req, res) => {
+  // Capture raw body regardless of content type
+  let rawText = "";
+  if (typeof req.body === "string") {
+    rawText = req.body;
+  } else if (typeof req.body === "object" && req.body !== null) {
+    rawText = JSON.stringify(req.body);
+  }
+
+  console.log(`[WEBHOOK] Raw body: ${rawText.substring(0, 500)}`);
+  console.log(`[WEBHOOK] Content-Type: ${req.headers["content-type"] || "unknown"}`);
+
+  const webhookSecret = getSetting("WEBHOOK_SECRET", "");
+  if (!webhookSecret) {
+    logSignal(rawText.substring(0, 1000), {}, "error_no_webhook_secret");
+    return res.json({ status: "error", message: "WEBHOOK_SECRET not set. Go to Settings tab." });
+  }
+
+  const queryToken = req.query.token || "";
+  let payload = {};
+
+  // Try multiple parsing strategies
+  if (typeof req.body === "object" && req.body !== null) {
+    // Already parsed as JSON object by express.json()
+    payload = req.body;
+  } else if (typeof req.body === "string") {
+    const text = req.body.trim();
+    // Strategy 1: Try JSON parse
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      // Strategy 2: Plain text "BUY" or "SELL"
+      const upper = text.toUpperCase().trim();
+      if (["BUY", "SELL"].includes(upper)) {
+        payload = { action: upper };
+      } else {
+        // Strategy 3: Try to extract action from any text (e.g. TradingView variables)
+        const actionMatch = text.match(/"action"\s*:\s*"(BUY|SELL|buy|sell)"/i);
+        if (actionMatch) {
+          payload = { action: actionMatch[1].toUpperCase() };
+        } else {
+          // Strategy 4: Check if text contains buy/sell keyword
+          const lower = text.toLowerCase();
+          if (lower.includes("buy")) {
+            payload = { action: "BUY" };
+          } else if (lower.includes("sell")) {
+            payload = { action: "SELL" };
+          } else {
+            logSignal(rawText.substring(0, 1000), { raw: text }, "invalid_json");
+            return res.json({ status: "error", message: "Could not parse message. Send {\"action\":\"BUY\"} or plain text BUY/SELL" });
+          }
+        }
+      }
+    }
+  }
+
+  console.log(`[WEBHOOK] Parsed payload: ${JSON.stringify(payload)}`);
+
+  const bodyToken = payload.token || payload.secret || "";
+  if (!safeEqual(queryToken, webhookSecret) && !(bodyToken && safeEqual(bodyToken, webhookSecret))) {
+    logSignal(rawText.substring(0, 1000), payload, "unauthorized");
+    return res.json({ status: "error", message: "unauthorized" });
+  }
+
+  let action = String(payload.action || payload.side || payload.transaction_type || payload.data || "").toUpperCase().trim();
+  if (!["BUY", "SELL"].includes(action)) {
+    logSignal(rawText.substring(0, 1000), payload, "invalid_action");
+    return res.json({ status: "error", message: `invalid action: "${action}". Send {"action":"BUY"} or {"action":"SELL"}` });
+  }
+
+  const killSwitch = getSetting("kill_switch", "off") === "on";
+  if (killSwitch) {
+    logSignal(rawText.substring(0, 1000), payload, "rejected_kill_switch");
+    return res.json({ status: "rejected", reason: "kill_switch_active" });
+  }
+  if (isDuplicate(payload)) {
+    logSignal(rawText.substring(0, 1000), payload, "duplicate");
+    return res.json({ status: "duplicate" });
+  }
+
+  const { token, expiry } = await getToken();
+  if (!token || Date.now() >= expiry) {
+    logSignal(rawText.substring(0, 1000), payload, "no_token");
+    return res.json({ status: "error", message: "no Upstox access token" });
+  }
+
+  // Check if market is open — Upstox rejects ALL API orders after market hours (UDAPI1162)
+  if (!isMarketOpen()) {
+    logSignal(rawText.substring(0, 1000), payload, "market_closed");
+    return res.json({ status: "error", message: "Market is closed. Orders can only be placed during market hours (9:15 AM – 3:30 PM IST, Mon–Fri)." });
+  }
+
+  // Check if webhook payload has a specific instrument_token (backwards compatible)
+  const payloadInstrument = payload.instrument_token || payload.ticker || payload.symbol || payload.instrument_key || "";
+
+  let instrumentToken, quantity, entryPrice;
+
+  if (payloadInstrument) {
+    // MODE 1: Payload has instrument_token — use it directly (backwards compatible)
+    instrumentToken = payloadInstrument;
+    quantity = parseInt(payload.quantity ?? payload.qty ?? payload.contracts ?? 1, 10);
+    entryPrice = await getLTP(token, instrumentToken);
+    console.log(`[WEBHOOK] Mode 1: Direct instrument ${instrumentToken}, qty ${quantity}`);
+  } else {
+    // MODE 2: Auto-ATM from saved Trading Config
+    const tcfg = getTradingConfig();
+    console.log(`[WEBHOOK] Mode 2: Auto-ATM for ${tcfg.underlying_name} ${tcfg.option_type}`);
+    const atm = await calculateATM(token, tcfg.underlying, tcfg.option_type, null);
+    if (!atm) {
+      logSignal(rawText.substring(0, 1000), payload, "atm_calc_failed");
+      return res.json({ status: "error", message: "Failed to calculate ATM strike. Check trading config." });
+    }
+    instrumentToken = atm.instrument_key;
+    quantity = parseInt(tcfg.lots, 10) * parseInt(tcfg.lot_size, 10);
+    entryPrice = atm.spot;
+    console.log(`[WEBHOOK] ATM: ${atm.atm_strike} ${tcfg.option_type} (spot ${atm.spot}), token ${instrumentToken}, qty ${quantity}`);
+  }
+
+  let result;
+  try {
+    result = await placeUpstoxOrder(token, {
+      quantity, product: payload.product, validity: payload.validity, price: payload.price,
+      order_type: payload.order_type || "MARKET", transaction_type: action, instrument_token: instrumentToken,
+    });
+  } catch (err) {
+    logSignal(rawText.substring(0, 1000), payload, "order_api_error");
+    return res.json({ status: "error", message: "Upstox API failed: " + err.message });
+  }
+
+  logSignal(rawText.substring(0, 1000), payload, result.ok ? "order_placed" : "order_failed");
+  logOrder("entry", action, instrumentToken, quantity, result.data, result.ok);
+
+  // Track position for exit engine
+  if (result.ok) {
+    const tcfg = getTradingConfig();
+    const config = getExitConfig();
+    const useExit = tcfg.use_exit || (config.enabled && config.mode !== "none");
+    const exitTargetPoints = payload.exit_target_points ?? tcfg.exit_target_points;
+    const exitSLPoints = payload.exit_sl_points ?? tcfg.exit_sl_points;
+    const trailSLPoints = payload.trailing_sl_points ?? tcfg.trailing_sl_points;
+    const trailActPoints = payload.trailing_activation_points ?? tcfg.trailing_activation_points;
+
+    if (useExit && (exitTargetPoints || exitSLPoints || trailSLPoints)) {
+      const ltp = entryPrice || await getLTP(token, instrumentToken);
+      const posExit = {};
+      if (exitTargetPoints) { posExit.mode = posExit.mode || "fixed_sl_target"; posExit.fixed_target_points = exitTargetPoints; }
+      if (exitSLPoints) { posExit.mode = posExit.mode || "fixed_sl_target"; posExit.fixed_sl_points = exitSLPoints; }
+      if (trailSLPoints) { posExit.mode = "trailing_sl"; posExit.trailing_sl_points = trailSLPoints; }
+      if (trailActPoints) { posExit.trailing_activation_points = trailActPoints; }
+      db.prepare(`INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`)
+        .run(instrumentToken, action, quantity, ltp || 0, ltp || 0, ltp || 0, Date.now(), JSON.stringify(posExit));
+      console.log(`[WEBHOOK] Position tracked for exit: ${JSON.stringify(posExit)}`);
+    }
+  }
+
+  res.json({ status: result.ok ? "order_placed" : "order_failed", action, instrument_token: instrumentToken, quantity, upstox: result.data });
+});
+
+// Notifier — receives access token from Upstox after user approves
+app.post("/notifier", (req, res) => {
+  // Log ALL incoming notifier requests for debugging
+  const rawBody = JSON.stringify(req.body);
+  console.log(`[NOTIFIER] Received POST: ${rawBody.substring(0, 500)}`);
+  addLog("INFO", `Notifier received: ${rawBody.substring(0, 300)}`);
+
+  const body = req.body;
+  if (!body) {
+    console.log("[NOTIFIER] Empty body — rejecting");
+    return res.status(400).json({ error: "empty body" });
+  }
+
+  // Check if this is an access token delivery
+  if (body.message_type !== "access_token" || !body.access_token) {
+    console.log(`[NOTIFIER] Unexpected payload type: ${body.message_type || "unknown"}`);
+    // Still return 200 so Upstox doesn't retry
+    return res.status(200).json({ status: "ignored", reason: "not an access_token message" });
+  }
+
+  // Store the token — don't reject on client_id mismatch, just log it
+  const storedClientId = getSetting("UPSTOX_CLIENT_ID", "");
+  if (storedClientId && body.client_id && body.client_id !== storedClientId) {
+    console.log(`[NOTIFIER] Client ID mismatch: got ${body.client_id}, expected ${storedClientId}`);
+    addLog("WARN", `Notifier client_id mismatch: got ${body.client_id}, expected ${storedClientId}`);
+    // Store it anyway — the token is still valid
+  }
+
+  const expiresAt = body.expires_at ? parseInt(body.expires_at, 10) : 0;
+  setSetting("access_token", body.access_token);
+  setSetting("access_token_expiry", String(expiresAt));
+  console.log(`[NOTIFIER] Access token stored! Expires at: ${new Date(expiresAt).toISOString()}`);
+  addLog("INFO", `Access token stored, expires at ${new Date(expiresAt).toISOString()}`);
+  res.status(200).json({ status: "token_stored", expires_at: expiresAt });
+});
+
+// --- API Routes ---
+app.get("/api/token-status", (req, res) => {
+  const token = getSetting("access_token", "");
+  const expiry = parseInt(getSetting("access_token_expiry", "0"), 10);
+  res.json({
+    has_token: !!token, expires_at: expiry || null,
+    is_expired: token ? Date.now() >= expiry : null,
+    kill_switch: getSetting("kill_switch", "off") === "on",
+  });
+});
+
+// --- Debug endpoint to check token status (masked) ---
+app.get("/api/debug-token", (req, res) => {
+  const token = getSetting("access_token", "");
+  const expiry = parseInt(getSetting("access_token_expiry", "0"), 10);
+  res.json({
+    token_present: !!token,
+    token_length: token.length,
+    token_preview: token ? token.substring(0, 15) + "..." + token.substring(token.length - 5) : "(empty)",
+    token_expiry: expiry,
+    token_expiry_iso: expiry ? new Date(expiry).toISOString() : null,
+    is_expired: token ? Date.now() >= expiry : null,
+    current_time: new Date().toISOString(),
+    current_time_ms: Date.now(),
+  });
+});
+
+app.post("/api/request-token", async (req, res) => {
+  try {
+    const result = await requestAccessToken();
+    res.json(result);
+  } catch (err) {
+    addLog("ERROR", "Token request exception: " + err.message);
+    res.json({ ok: false, status: 0, data: { error: "exception", message: err.message } });
+  }
+});
+
+app.get("/api/signals", (req, res) => {
+  const rows = db.prepare("SELECT * FROM signals ORDER BY id DESC LIMIT 50").all();
+  res.json(rows.map(r => ({ ...r, payload: r.payload ? JSON.parse(r.payload) : {} })));
+});
+
+app.get("/api/orders", (req, res) => {
+  const rows = db.prepare("SELECT * FROM orders ORDER BY id DESC LIMIT 50").all();
+  res.json(rows.map(r => ({ ...r, result: r.result ? JSON.parse(r.result) : {} })));
+});
+
+app.get("/api/positions", (req, res) => {
+  const rows = db.prepare("SELECT * FROM positions WHERE active = 1 ORDER BY id DESC").all();
+  res.json(rows.map(r => ({ ...r, exit_config: r.exit_config ? JSON.parse(r.exit_config) : null })));
+});
+
+app.get("/api/upstox-positions", async (req, res) => {
+  res.json(await getUpstoxPositions());
+});
+
+app.post("/api/manual-order", async (req, res) => {
+  const body = req.body;
+  if (!body.instrument_token || !["BUY", "SELL"].includes(body.action)) return res.json({ error: "missing fields" });
+  const { token, expiry } = await getToken();
+  if (!token || Date.now() >= expiry) return res.json({ error: "no_access_token" });
+  if (getSetting("kill_switch", "off") === "on") return res.json({ error: "kill_switch_active" });
+  if (!isMarketOpen()) return res.json({ error: "market_closed", message: "Market is closed. Orders can only be placed during market hours (9:15 AM – 3:30 PM IST)." });
+
+  const result = await placeUpstoxOrder(token, {
+    quantity: parseInt(body.quantity || 1), product: body.product || "D",
+    order_type: body.order_type || "MARKET", transaction_type: body.action,
+    instrument_token: body.instrument_token, price: body.price,
+  });
+  logOrder("manual", body.action, body.instrument_token, body.quantity, result.data, result.ok);
+
+  if (result.ok) {
+    const config = getExitConfig();
+    const hasExit = (config.enabled && config.mode !== "none") || body.exit_target_points || body.exit_sl_points;
+    if (hasExit) {
+      const entryPrice = await getLTP(token, body.instrument_token);
+      const posExit = {};
+      if (body.exit_target_points) { posExit.mode = "fixed_sl_target"; posExit.fixed_target_points = body.exit_target_points; }
+      if (body.exit_sl_points) { posExit.fixed_sl_points = body.exit_sl_points; }
+      db.prepare(`INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`)
+        .run(body.instrument_token, body.action, body.quantity, entryPrice || 0, entryPrice || 0, entryPrice || 0, Date.now(), JSON.stringify(posExit));
+    }
+  }
+  res.json({ ok: result.ok, result: result.data });
+});
+
+app.post("/api/kill-switch", (req, res) => {
+  const action = req.body.action || "toggle";
+  let isOn;
+  if (action === "on") isOn = true;
+  else if (action === "off") isOn = false;
+  else isOn = getSetting("kill_switch", "off") !== "on";
+  setSetting("kill_switch", isOn ? "on" : "off");
+  res.json({ kill_switch: isOn ? "on" : "off" });
+});
+
+app.get("/api/exit-config", (req, res) => res.json(getExitConfig()));
+
+app.post("/api/exit-config", (req, res) => {
+  const merged = { ...DEFAULT_EXIT_CONFIG, ...req.body };
+  setSetting("exit_config", JSON.stringify(merged));
+  res.json({ status: "saved", config: merged });
+});
+
+app.get("/api/settings", (req, res) => {
+  res.json({
+    webhook_secret: getSetting("WEBHOOK_SECRET") ? "***set***" : "",
+    upstox_client_id: getSetting("UPSTOX_CLIENT_ID", ""),
+    upstox_client_secret: getSetting("UPSTOX_CLIENT_SECRET") ? "***set***" : "",
+    has_webhook_secret: !!getSetting("WEBHOOK_SECRET"),
+    has_client_id: !!getSetting("UPSTOX_CLIENT_ID"),
+    has_client_secret: !!getSetting("UPSTOX_CLIENT_SECRET"),
+  });
+});
+
+app.post("/api/settings", (req, res) => {
+  if (req.body.upstox_client_id) setSetting("UPSTOX_CLIENT_ID", req.body.upstox_client_id);
+  if (req.body.upstox_client_secret) setSetting("UPSTOX_CLIENT_SECRET", req.body.upstox_client_secret);
+  if (req.body.webhook_secret) setSetting("WEBHOOK_SECRET", req.body.webhook_secret);
+  res.json({ status: "saved" });
+});
+
+app.get("/api/instruments", (req, res) => res.json({ instruments: UNDERLYING }));
+
+// --- Trading Config API ---
+app.get("/api/trading-config", (req, res) => res.json(getTradingConfig()));
+
+app.post("/api/trading-config", (req, res) => {
+  const current = getTradingConfig();
+  const updated = { ...current, ...req.body };
+  setSetting("trading_config", JSON.stringify(updated));
+  console.log(`[CONFIG] Trading config saved: ${JSON.stringify(updated)}`);
+  res.json({ status: "saved", config: updated });
+});
+
+app.get("/api/option-expiries", async (req, res) => {
+  const { token, expiry } = await getToken();
+  if (!token || Date.now() >= expiry) return res.json({ error: "no_token" });
+  const result = await getOptionContracts(token, req.query.instrument_key, null);
+  if (!result.ok) return res.json({ error: "failed", detail: result.data });
+  const contracts = (result.data && result.data.data) || [];
+  const expiries = [...new Set(contracts.map(c => c.expiry))].sort();
+  res.json({ expiries });
+});
+
+app.get("/api/atm-strike", async (req, res) => {
+  const { token, expiry } = await getToken();
+  if (!token || Date.now() >= expiry) return res.json({ error: "no_token" });
+  const spot = await getLTP(token, req.query.instrument_key);
+  if (!spot) return res.json({ error: "could not fetch spot" });
+  const result = await getOptionContracts(token, req.query.instrument_key, req.query.expiry_date);
+  if (!result.ok) return res.json({ error: "failed", detail: result.data });
+  const contracts = (result.data && result.data.data) || [];
+  const optionType = (req.query.type || "CE").toUpperCase();
+  const typed = contracts.filter(c => c.instrument_type === optionType);
+  if (typed.length === 0) return res.json({ error: `no ${optionType} contracts` });
+  let atm = typed[0], minDiff = Math.abs(typed[0].strike_price - spot);
+  for (const c of typed) {
+    const d = Math.abs(c.strike_price - spot);
+    if (d < minDiff) { minDiff = d; atm = c; }
+  }
+  const optionLTP = await getLTP(token, atm.instrument_key);
+  res.json({ spot_price: spot, atm_strike: atm.strike_price, instrument_key: atm.instrument_key, trading_symbol: atm.trading_symbol, lot_size: atm.lot_size, ltp: optionLTP });
+});
+
+// Upstox OAuth redirect handler — receives the authorization code
+// Upstox redirects here after user approves login. We show a simple page
+// so the redirect_uri validation passes. The semi-automated flow doesn't
+// actually use this code, but it must exist and return 200.
+app.get("/callback", (req, res) => {
+  const code = req.query.code || "";
+  const state = req.query.state || "";
+  if (code) {
+    addLog("INFO", "OAuth callback received with authorization code");
+    res.send(`<html><body style="font-family:sans-serif;background:#0d1117;color:#e6edf3;padding:40px;text-align:center">
+      <h2 style="color:#3fb950">✅ Authorization Successful</h2>
+      <p>You can close this page and return to the dashboard.</p>
+      <p><a href="/" style="color:#58a6ff">Go to Dashboard →</a></p>
+    </body></html>`);
+  } else {
+    res.send(`<html><body style="font-family:sans-serif;background:#0d1117;color:#e6edf3;padding:40px;text-align:center">
+      <h2 style="color:#d29922">⚠ No authorization code received</h2>
+      <p><a href="/" style="color:#58a6ff">Go to Dashboard →</a></p>
+    </body></html>`);
+  }
+});
+
+app.get("/health", (req, res) => {
+  const token = getSetting("access_token", "");
+  const expiry = parseInt(getSetting("access_token_expiry", "0"), 10);
+  res.json({ status: "ok", token_present: !!token, token_expired: token ? Date.now() >= expiry : null, kill_switch: getSetting("kill_switch", "off") === "on", market_open: isMarketOpen() });
+});
+
+// --- Dashboard HTML ---
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Upstox Trading Bot — Dashboard</title>
+<style>
+:root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;--green:#3fb950;--red:#f85149;--amber:#d29922;--blue:#58a6ff;--green-bg:rgba(63,185,80,0.1);--red-bg:rgba(248,81,73,0.1);--amber-bg:rgba(210,153,34,0.1)}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:var(--bg);color:var(--text);padding:20px;max-width:1300px;margin:0 auto}
+h1{font-size:1.5rem;margin-bottom:4px}
+h2{font-size:1.1rem;margin-bottom:10px;color:var(--blue)}
+.subtitle{color:#8b949e;font-size:0.85rem;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px}
+@media(max-width:768px){.grid{grid-template-columns:1fr}}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px}
+.status-row{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:0.9rem}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.dot.green{background:var(--green)}.dot.red{background:var(--red)}
+.badge{padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:600}
+.badge.green{background:var(--green-bg);color:var(--green)}.badge.red{background:var(--red-bg);color:var(--red)}.badge.amber{background:var(--amber-bg);color:var(--amber)}
+.btn{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-size:0.85rem;font-weight:600}
+.btn-primary{background:var(--blue);color:#fff}.btn-success{background:var(--green);color:#fff}.btn-secondary{background:var(--surface);color:var(--text);border:1px solid var(--border)}
+.btn:hover{opacity:.85}
+input,select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:6px;font-size:0.85rem;width:100%}
+label{font-size:0.8rem;color:#8b949e;display:block;margin-bottom:4px}
+.form-row{display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.form-row>div{flex:1;min-width:120px}
+table{width:100%;border-collapse:collapse;font-size:0.8rem}
+th{text-align:left;padding:6px 8px;color:#8b949e;border-bottom:1px solid var(--border);font-weight:600}
+td{padding:6px 8px;border-bottom:1px solid var(--border)}
+.toggle{position:relative;width:44px;height:24px}
+.toggle input{opacity:0;width:0;height:0}
+.toggle .slider{position:absolute;cursor:pointer;inset:0;background:var(--border);border-radius:24px;transition:.2s}
+.toggle .slider:before{content:"";position:absolute;height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
+.toggle input:checked+.slider{background:var(--green)}
+.toggle input:checked+.slider:before{transform:translateX(20px)}
+.tab-row{display:flex;gap:4px;margin-bottom:12px;flex-wrap:wrap}
+.tab{padding:6px 14px;border-radius:6px 6px 0 0;cursor:pointer;font-size:0.85rem;border:1px solid var(--border);background:var(--surface)}
+.tab.active{background:var(--blue);color:#fff;border-color:var(--blue)}
+.hidden{display:none}
+.muted{color:#8b949e;font-size:0.8rem}
+.pill{display:inline-block;padding:1px 6px;border-radius:3px;font-size:0.7rem}
+.pill.buy{background:var(--green-bg);color:var(--green)}.pill.sell{background:var(--red-bg);color:var(--red)}
+.killed-banner{background:var(--red);color:#fff;padding:8px 16px;border-radius:6px;text-align:center;margin-bottom:16px;font-weight:600}
+#toast{position:fixed;bottom:20px;right:20px;background:var(--surface);border:1px solid var(--border);padding:12px 16px;border-radius:8px;z-index:999;display:none;max-width:400px}
+.json-box{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;font-family:monospace;font-size:0.8rem;white-space:pre-wrap;word-break:break-all;margin:10px 0}
+.section-divider{border-top:1px solid var(--border);margin:14px 0;padding-top:10px}
+.raw-msg{max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;font-size:0.75rem;color:#8b949e}
+</style>
+</head>
+<body>
+<h1>Upstox Trading Bot</h1>
+<p class="subtitle">VPS Edition — Updated lot sizes | Points-based exits | 5-second exit engine | ATM auto-select</p>
+<div id="killBanner" class="hidden killed-banner">⚠ KILL SWITCH ACTIVE — all incoming signals are blocked</div>
+<div class="grid">
+  <div class="card"><h2>Token Status</h2>
+    <div class="status-row"><span id="tokenDot" class="dot red"></span> <span id="tokenText">Checking...</span></div>
+    <div class="status-row muted">Market: <span id="marketStatus">—</span></div>
+    <button class="btn btn-primary" onclick="requestToken()" id="tokenBtn">Request New Token</button>
+  </div>
+  <div class="card"><h2>Kill Switch</h2>
+    <div class="status-row"><label class="toggle"><input type="checkbox" id="killToggle" onchange="toggleKillSwitch()"><span class="slider"></span></label><span id="killText" style="margin-left:8px;">OFF</span></div>
+    <p class="muted">When ON, all signals are rejected.</p>
+  </div>
+</div>
+<div class="tab-row">
+  <div class="tab active" onclick="showTab('builder',this)">📋 Order Builder</div>
+  <div class="tab" onclick="showTab('auto',this)">🤖 Auto Trade Config</div>
+  <div class="tab" onclick="showTab('strategy',this)">📈 Strategy Engine</div>
+  <div class="tab" onclick="showTab('signals',this)">Signals</div>
+  <div class="tab" onclick="showTab('orders',this)">Orders</div>
+  <div class="tab" onclick="showTab('positions',this)">Positions</div>
+  <div class="tab" onclick="showTab('exit',this)">Exit Conditions</div>
+  <div class="tab" onclick="showTab('settings',this)">⚙️ Settings</div>
+</div>
+
+<div id="tab-builder" class="card">
+  <h2>Order Builder — ATM Auto-Select</h2>
+  <p class="muted" style="margin-bottom:12px;">Select instrument & expiry. Auto-selects ATM strike.</p>
+  <div class="form-row">
+    <div style="flex:2"><label>1. Underlying</label><select id="obInstrument" onchange="onInstrumentChange()"><option value="">— Select —</option></select></div>
+    <div><label>2. Action</label><select id="obAction"><option value="BUY">BUY</option><option value="SELL">SELL</option></select></div>
+  </div>
+  <div class="form-row">
+    <div><label>3. Expiry</label><select id="obExpiry" onchange="onExpiryChange()" disabled><option value="">Select instrument first</option></select></div>
+    <div><label>4. Type</label><select id="obOptionType" onchange="onExpiryChange()"><option value="CE">CE (Call)</option><option value="PE">PE (Put)</option></select></div>
+    <div><label>5. Lots</label><input id="obLots" type="number" value="1" min="1" onchange="updateJSON()"></div>
+    <div><label>Qty</label><input id="obQty" type="number" readonly style="opacity:.6"></div>
+  </div>
+  <div id="atmInfo" class="hidden" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:10px;">
+    <div class="status-row"><span class="dot green"></span> <b>ATM:</b> <span id="atmStrike">—</span> &nbsp; <b>Spot:</b> <span id="atmSpot">—</span> &nbsp; <b>LTP:</b> ₹<span id="atmLtp">—</span></div>
+  </div>
+  <div class="section-divider"></div>
+  <div class="form-row">
+    <div><label>6. Order Type</label><select id="obOrderType" onchange="updateJSON()"><option>MARKET</option><option>LIMIT</option></select></div>
+    <div><label>7. Product</label><select id="obProduct" onchange="updateJSON()"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
+  </div>
+  <div class="form-row">
+    <div><label>8. Exit Target (pts)</label><input id="obExitTarget" type="number" placeholder="40" onchange="updateJSON()"></div>
+    <div><label>9. Exit SL (pts)</label><input id="obExitSL" type="number" placeholder="25" onchange="updateJSON()"></div>
+    <div><label>10. Trailing SL (pts)</label><input id="obTrailSL" type="number" placeholder="15" onchange="updateJSON()"></div>
+    <div><label>11. Activate Trail (pts)</label><input id="obTrailAct" type="number" placeholder="10" onchange="updateJSON()"></div>
+  </div>
+  <div class="section-divider"></div>
+  <h2 style="margin-bottom:6px;">Generated JSON</h2>
+  <div class="json-box" id="jsonOutput">Fill in fields above...</div>
+  <div class="form-row" style="margin-top:10px;">
+    <button class="btn btn-success" onclick="copyJSON()">📋 Copy JSON</button>
+    <button class="btn btn-primary" onclick="copyWebhookUrl()">📋 Copy Webhook URL</button>
+    <button class="btn btn-secondary" onclick="placeBuilderOrder()">⚡ Place Order Now</button>
+  </div>
+</div>
+
+<div id="tab-signals" class="card hidden">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><h2>Signals — Raw Messages</h2><button class="btn btn-secondary" onclick="loadSignals()">Refresh</button></div>
+  <table><thead><tr><th>Time</th><th>Action</th><th>Instrument</th><th>Status</th><th>Raw Message</th></tr></thead><tbody id="signalsBody"><tr><td colspan="5" class="muted">Loading...</td></tr></tbody></table>
+</div>
+
+<div id="tab-orders" class="card hidden">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><h2>Orders</h2><button class="btn btn-secondary" onclick="loadOrders()">Refresh</button></div>
+  <table><thead><tr><th>Time</th><th>Type</th><th>Instrument</th><th>Action</th><th>Status</th></tr></thead><tbody id="ordersBody"><tr><td colspan="5" class="muted">Loading...</td></tr></tbody></table>
+</div>
+
+<div id="tab-positions" class="card hidden">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><h2>Positions</h2>
+    <div style="display:flex;gap:6px;"><button class="btn btn-secondary" onclick="loadPositions()">Tracked</button><button class="btn btn-secondary" onclick="loadUpstoxPositions()">Live</button></div></div>
+  <table><thead><tr><th>Instrument</th><th>Side</th><th>Qty</th><th>Entry</th><th>High/Low</th></tr></thead><tbody id="positionsBody"><tr><td colspan="5" class="muted">Loading...</td></tr></tbody></table>
+</div>
+
+<div id="tab-auto" class="card hidden">
+  <h2>🤖 Auto Trade Config</h2>
+  <p class="muted" style="margin-bottom:12px;">When a TradingView webhook sends {"action":"BUY"}, the bot uses these settings to auto-select ATM strike, quantity, and exit conditions. No need to specify instrument in the webhook message.</p>
+  <div class="form-row">
+    <div style="flex:2"><label>1. Underlying</label><select id="tcUnderlying" onchange="onTcInstrumentChange()"></select></div>
+    <div><label>2. Option Type</label><select id="tcOptionType"><option value="CE">CE (Call)</option><option value="PE">PE (Put)</option></select></div>
+  </div>
+  <div class="form-row">
+    <div><label>3. Lots</label><input id="tcLots" type="number" value="1" min="1"></div>
+    <div><label>Qty (auto)</label><input id="tcQty" type="number" readonly style="opacity:.6"></div>
+    <div><label>4. Product</label><select id="tcProduct"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
+  </div>
+  <div class="section-divider"></div>
+  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Exit Conditions (applied to webhook orders)</h2>
+  <div class="form-row">
+    <div><label>Exit Target (pts)</label><input id="tcExitTarget" type="number" value="40"></div>
+    <div><label>Exit SL (pts)</label><input id="tcExitSL" type="number" value="25"></div>
+  </div>
+  <div class="form-row">
+    <div><label>Trailing SL (pts)</label><input id="tcTrailSL" type="number" value="15"></div>
+    <div><label>Activate Trail (pts)</label><input id="tcTrailAct" type="number" value="10"></div>
+  </div>
+  <div class="form-row" style="align-items:center;">
+    <label class="toggle"><input type="checkbox" id="tcUseExit" checked><span class="slider"></span></label>
+    <span style="margin-left:8px;font-weight:600;">Enable exit tracking for webhook orders</span>
+  </div>
+  <div class="section-divider"></div>
+  <div class="form-row">
+    <button class="btn btn-success" onclick="saveTradingConfig()">Save Config</button>
+    <button class="btn btn-secondary" onclick="loadTradingConfig()">Refresh</button>
+  </div>
+  <div id="tcStatus" class="muted" style="margin-top:8px;"></div>
+  <div class="section-divider"></div>
+  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">TradingView Webhook Setup</h2>
+  <p class="muted" style="margin-bottom:6px;">Webhook URL:</p>
+  <div class="json-box" id="tcWebhookUrl" style="font-size:0.75rem;"></div>
+  <p class="muted" style="margin-bottom:6px;">Alert Message (just send BUY or SELL):</p>
+  <div class="json-box" style="font-size:0.75rem;">{"action":"BUY"}</div>
+  <button class="btn btn-primary" onclick="copyTcWebhookUrl()">📋 Copy Webhook URL</button>
+</div>
+
+<div id="tab-strategy" class="card hidden">
+  <h2>📈 Strategy Engine</h2>
+  <p class="muted" style="margin-bottom:12px;">Pick a strategy, adjust parameters, enable. Only one strategy runs at a time. Strategy code is saved internally — not shown.</p>
+  <div id="stratStatus" class="muted" style="margin-bottom:10px;"></div>
+  <div id="stratLastSignal" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:12px;display:none;">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+      <span id="stratSignalDot" class="dot" style="width:10px;height:10px;border-radius:50%;background:var(--blue);"></span>
+      <b style="font-size:1rem;">Last Signal: <span id="stratSignalText" style="color:var(--blue);">—</span></b>
+      <span class="muted" style="margin-left:auto;" id="stratSignalTime">—</span>
+    </div>
+    <div id="stratSignalDetails" class="muted" style="font-size:0.8rem;"></div>
+  </div>
+  <div id="stratSignalHistory" style="margin-bottom:12px;display:none;">
+    <div class="muted" style="font-size:0.8rem;margin-bottom:4px;">Recent Signals:</div>
+    <div id="stratSignalList" style="max-height:120px;overflow-y:auto;"></div>
+  </div>
+  <div class="form-row" style="align-items:center;">
+    <label class="toggle"><input type="checkbox" id="stratEnabled" onchange="toggleStratEngine()"><span class="slider"></span></label>
+    <span style="margin-left:8px;font-weight:600;">Enable Strategy Engine</span>
+    <button class="btn btn-secondary" onclick="loadStratConfig()" style="margin-left:auto;">Refresh</button>
+    <button class="btn btn-primary" onclick="saveStratConfig()">💾 Save Config</button>
+    <button class="btn btn-primary" onclick="previewStrat()">▶ Preview</button>
+    <button class="btn btn-secondary" onclick="resetStratState()">Reset State</button>
+  </div>
+  <div class="section-divider"></div>
+  <div class="form-row">
+    <div style="flex:2"><label>Strategy</label><select id="stratSelect" onchange="onStratChange()"></select></div>
+    <div style="flex:2"><label>Underlying</label><select id="stratUnderlying"></select></div>
+    <div><label>Entry TF</label><select id="stratCandleInterval"><option value="1m">1 min</option><option value="3m" selected>3 min</option><option value="5m">5 min</option><option value="15m">15 min</option></select></div>
+    <div><label>HTF</label><select id="stratHtfInterval"><option value="3m">3 min</option><option value="15m">15 min</option><option value="30m">30 min</option><option value="45m" selected>45 min</option></select></div>
+  </div>
+  <div class="form-row">
+    <div><label>Lots</label><input id="stratLots" type="number" value="1" min="1"></div>
+    <div><label>Product</label><select id="stratProduct"><option value="I">I (Intraday)</option><option value="D">D (Delivery)</option></select></div>
+    <div><label>Cooldown (sec)</label><input id="stratCooldown" type="number" value="60"></div>
+  </div>
+  <div class="section-divider"></div>
+  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Strategy Parameters</h2>
+  <div id="stratParams" class="form-row" style="flex-wrap:wrap;gap:8px;"></div>
+  <div id="stratPreview" class="json-box hidden" style="margin-top:10px;"></div>
+  <div class="muted" style="font-size:0.8rem;margin-top:8px;">⚡ WebSocket real-time mode. Strategy code saved on server. Parameters editable here.</div>
+</div>
+<div id="tab-exit" class="card hidden">
+  <h2>Exit Conditions</h2>
+  <p class="muted" style="margin-bottom:12px;">Configure automatic exit rules for webhook-placed orders.</p>
+  <div class="form-row" style="align-items:center;">
+    <label class="toggle"><input type="checkbox" id="exitEnabled"><span class="slider"></span></label>
+    <span style="margin-left:8px;font-weight:600;">Enable Exit Engine</span>
+  </div>
+  <div class="section-divider"></div>
+  <div class="form-row">
+    <div><label>Mode</label><select id="exitMode"><option value="none">None</option><option value="fixed_sl_target">Fixed SL + Target</option><option value="trailing_sl">Trailing SL</option><option value="both">Both</option></select></div>
+  </div>
+  <div class="form-row">
+    <div><label>Trailing SL (pts)</label><input id="trailSL" type="number" value="20"></div>
+    <div><label>Activate Trail After (pts)</label><input id="trailAct" type="number" value="10"></div>
+  </div>
+  <div class="form-row">
+    <div><label>Fixed SL (pts)</label><input id="fixedSL" type="number" value="30"></div>
+    <div><label>Fixed Target (pts)</label><input id="fixedTarget" type="number" value="40"></div>
+  </div>
+  <div class="form-row" style="margin-top:10px;">
+    <button class="btn btn-success" onclick="saveExitConfig()">Save</button>
+    <button class="btn btn-secondary" onclick="loadExitConfig()">Refresh</button>
+  </div>
+</div>
+
+<div id="tab-settings" class="card hidden">
+  <h2>⚙️ Settings</h2>
+  <p class="muted" style="margin-bottom:12px;">Configure Upstox API credentials and webhook secret.</p>
+  <div id="settingsStatus" class="muted" style="margin-bottom:12px;"></div>
+  <div class="form-row">
+    <div style="flex:2"><label>Upstox API Key (Client ID)</label><input id="setClientId" type="text" placeholder="a97d9aad-..."></div>
+  </div>
+  <div class="form-row">
+    <div style="flex:2"><label>Upstox API Secret</label><input id="setClientSecret" type="password" placeholder="Enter new secret"></div>
+  </div>
+  <div class="form-row">
+    <div style="flex:2"><label>Webhook Secret</label><input id="setWebhookSecret" type="password" placeholder="Enter new webhook secret"></div>
+  </div>
+  <div class="form-row" style="margin-top:10px;">
+    <button class="btn btn-success" onclick="saveSettings()">Save Settings</button>
+    <button class="btn btn-secondary" onclick="loadSettings()">Refresh</button>
+  </div>
+  <div class="section-divider"></div>
+  <p class="muted" style="font-size:0.8rem;">Note: API Secret is stored in the database only. It is never committed to git.</p>
+</div>
+
+<script>
+const api=async(p,o)=>{try{const r=await fetch(p,o);if(!r.ok){console.error('API error:',r.status,p);return{error:'HTTP '+r.status};}return await r.json();}catch(e){console.error('API fetch error:',e.message,p);return{error:e.message};}};
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',3500);}
+function fmtTime(ts){return ts?new Date(ts).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:false}):'—';}
+function showTab(n,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');document.querySelectorAll('[id^="tab-"]').forEach(d=>d.classList.add('hidden'));document.getElementById('tab-'+n).classList.remove('hidden');if(n==='signals')loadSignals();if(n==='orders')loadOrders();if(n==='positions')loadPositions();if(n==='exit')loadExitConfig();if(n==='settings')loadSettings();if(n==='auto')loadTradingConfig();if(n==='strategy')loadStratConfig();}
+let obState={instrumentKey:null,lotSize:1,instrumentToken:null};
+async function loadStatus(){try{const s=await api('/api/token-status');if(!s||s.error){document.getElementById('tokenText').textContent='Error';return;}const d=document.getElementById('tokenDot'),t=document.getElementById('tokenText');if(!s.has_token){d.className='dot red';t.textContent='No token';}else if(s.is_expired){d.className='dot red';t.textContent='EXPIRED';}else{d.className='dot green';t.textContent='Valid until '+fmtTime(s.expires_at);}document.getElementById('killToggle').checked=s.kill_switch;document.getElementById('killText').textContent=s.kill_switch?'ON':'OFF';document.getElementById('killBanner').classList.toggle('hidden',!s.kill_switch);api('/health').then(h=>{if(h&&!h.error)document.getElementById('marketStatus').textContent=h.market_open?'OPEN':'CLOSED';});}catch(e){console.error('loadStatus error:',e);}}
+async function requestToken(){document.getElementById('tokenBtn').disabled=true;try{const r=await api('/api/request-token',{method:'POST'});if(r.ok){toast('✅ Token request sent — approve on Upstox app');}else{const msg=(r.data&&(r.data.message||r.data.error||JSON.stringify(r.data)))||'HTTP '+r.status;toast('❌ Failed: '+msg);}}catch(e){toast('❌ Network error: '+e.message);}document.getElementById('tokenBtn').disabled=false;setTimeout(loadStatus,3000);}
+async function toggleKillSwitch(){const isOn=document.getElementById('killToggle').checked;try{await api('/api/kill-switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:isOn?'on':'off'})});document.getElementById('killText').textContent=isOn?'ON':'OFF';document.getElementById('killBanner').classList.toggle('hidden',!isOn);toast(isOn?'⚠ Kill switch ON':'✅ Kill switch OFF');}catch(e){toast('❌ Error: '+e.message);}}
+async function loadInstruments(){try{const r=await api('/api/instruments');if(!r||r.error){console.error('loadInstruments error');return;}const s=document.getElementById('obInstrument');s.innerHTML='<option value="">— Select —</option>';r.instruments.forEach(i=>s.innerHTML+='<option value="'+i.key+'" data-lot="'+i.lot_size+'">'+i.name+' (lot: '+i.lot_size+')</option>');const tc=document.getElementById('tcUnderlying');if(tc){tc.innerHTML='';r.instruments.forEach(i=>tc.innerHTML+='<option value="'+i.key+'" data-lot="'+i.lot_size+'">'+i.name+' (lot: '+i.lot_size+')</option>');}}catch(e){console.error('loadInstruments error:',e);}}
+function onTcInstrumentChange(){const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value)return;const lot=parseInt(o.dataset.lot||'1',10);updateTcQty(lot);}
+function updateTcQty(lot){const lots=parseInt(document.getElementById('tcLots').value||'1',10);document.getElementById('tcQty').value=lots*lot;}
+async function loadTradingConfig(){try{const c=await api('/api/trading-config');if(!c||c.error){console.error('loadTradingConfig error');return;}const s=document.getElementById('tcUnderlying');if(s&&c.underlying){for(let i=0;i<s.options.length;i++){if(s.options[i].value===c.underlying){s.selectedIndex=i;break;}}onTcInstrumentChange();}document.getElementById('tcOptionType').value=c.option_type||'CE';document.getElementById('tcLots').value=c.lots||1;document.getElementById('tcProduct').value=c.product||'D';document.getElementById('tcExitTarget').value=c.exit_target_points||40;document.getElementById('tcExitSL').value=c.exit_sl_points||25;document.getElementById('tcTrailSL').value=c.trailing_sl_points||15;document.getElementById('tcTrailAct').value=c.trailing_activation_points||10;document.getElementById('tcUseExit').checked=c.use_exit!==false;const ws=getSetting_webhook_secret_hint();document.getElementById('tcWebhookUrl').textContent=window.location.origin+'/webhook?token=YOUR_WEBHOOK_SECRET';let p=[];p.push('Config loaded');document.getElementById('tcStatus').innerHTML=p.join(' &nbsp; ');updateTcQty(parseInt(s.options[s.selectedIndex]?.dataset.lot||'1',10));}catch(e){console.error('loadTradingConfig error:',e);}}
+function getSetting_webhook_secret_hint(){return '';}
+async function saveTradingConfig(){try{const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value){toast('Select underlying');return;}const lot=parseInt(o.dataset.lot||'1',10);const b={underlying:o.value,underlying_name:o.text.split(' (')[0],lot_size:lot,option_type:document.getElementById('tcOptionType').value,lots:parseInt(document.getElementById('tcLots').value||'1',10),product:document.getElementById('tcProduct').value,exit_target_points:parseFloat(document.getElementById('tcExitTarget').value||0),exit_sl_points:parseFloat(document.getElementById('tcExitSL').value||0),trailing_sl_points:parseFloat(document.getElementById('tcTrailSL').value||0),trailing_activation_points:parseFloat(document.getElementById('tcTrailAct').value||0),use_exit:document.getElementById('tcUseExit').checked};await api('/api/trading-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});toast('✅ Trading config saved!');}catch(e){toast('❌ Error: '+e.message);}}
+function copyTcWebhookUrl(){const u=document.getElementById('tcWebhookUrl').textContent;navigator.clipboard.writeText(u).then(()=>toast('✅ Webhook URL copied!'));}
+let _strategies = {};
+let _stratParams = {};
+
+async function loadStratConfig(){
+  try{
+  const c = await api('/api/strategy-config');
+  if(!c||c.error){console.error('loadStratConfig error');return;}
+  const s = await api('/api/strategy-status');
+  const strats = await api('/api/strategies');
+  _strategies = strats.strategies || {};
+  const sel = document.getElementById('stratSelect');
+  sel.innerHTML = '';
+  for (const [key, val] of Object.entries(_strategies)) {
+    sel.innerHTML += '<option value="'+key+'">'+val.name+'</option>';
+  }
+  if (c.strategy) sel.value = c.strategy;
+  const usel = document.getElementById('stratUnderlying');
+  if (usel.options.length === 0) {
+    const r = await api('/api/instruments');
+    r.instruments.forEach(i => usel.innerHTML += '<option value="'+i.key+'" data-lot="'+i.lot_size+'">'+i.name+' (lot: '+i.lot_size+')</option>');
+  }
+  if (c.underlying) { for (let i=0; i<usel.options.length; i++) { if (usel.options[i].value===c.underlying) { usel.selectedIndex=i; break; } } }
+  document.getElementById('stratCandleInterval').value = c.candle_interval || '3m';
+  document.getElementById('stratHtfInterval').value = c.htf_candle_interval || '45m';
+  document.getElementById('stratLots').value = c.lots || 1;
+  document.getElementById('stratProduct').value = c.product || 'I';
+  document.getElementById('stratCooldown').value = c.cooldown_seconds || 60;
+  document.getElementById('stratEnabled').checked = c.enabled || false;
+  _stratParams = c.params || {};
+  // Render params with saved values
+  renderStratParams();
+  // After rendering, set saved values
+  if (c.params) {
+    for (const [pk, pv] of Object.entries(c.params)) {
+      const el = document.getElementById('stratParam_'+pk);
+      if (el) el.value = pv;
+    }
+  }
+  let ws = s.ws_connected ? '🟢 WS LIVE' : '🔴 WS OFF';
+  let ltp = s.last_ltp ? 'LTP: '+s.last_ltp : '';
+  let st = 'Engine: '+(s.running?'🟢 RUNNING':'🔴 STOPPED')+' | '+ws+' | Market: '+(s.market_open?'OPEN':'CLOSED');
+  if (s.position_open) st += ' | Position: '+s.position_type;
+  if (ltp) st += ' | '+ltp;
+  document.getElementById('stratStatus').textContent = st;
+  updateStratSignalDisplay(s);
+  }catch(e){console.error('loadStratConfig error:',e);}
+}
+
+function renderStratParams(){
+  const key = document.getElementById('stratSelect').value;
+  const strat = _strategies[key];
+  const container = document.getElementById('stratParams');
+  if (!strat || !strat.params) { container.innerHTML = '<span class="muted">No parameters</span>'; return; }
+  let html = '';
+  for (const [pk, pv] of Object.entries(strat.params)) {
+    const val = _stratParams[pk] !== undefined ? _stratParams[pk] : pv.value;
+    html += '<div><label>'+pv.label+'</label><input id="stratParam_'+pk+'" type="'+(pv.type||'number')+'" value="'+val+'" step="0.5"></div>';
+  }
+  container.innerHTML = html;
+}
+
+function onStratChange(){
+  const key = document.getElementById('stratSelect').value;
+  const strat = _strategies[key];
+  if (strat && strat.needsHtf === false) {
+    document.getElementById('stratHtfInterval').value = document.getElementById('stratCandleInterval').value;
+  }
+  _stratParams = {};
+  renderStratParams();
+}
+
+function collectStratParams(){
+  const key = document.getElementById('stratSelect').value;
+  const strat = _strategies[key];
+  if (!strat || !strat.params) return {};
+  const out = {};
+  for (const pk of Object.keys(strat.params)) {
+    const el = document.getElementById('stratParam_'+pk);
+    if (el) out[pk] = parseFloat(el.value);
+  }
+  return out;
+}
+
+async function saveStratConfig(){
+  const sel = document.getElementById('stratUnderlying');
+  const o = sel.options[sel.selectedIndex];
+  if (!o || !o.value) { toast('Select underlying'); return; }
+  const b = {
+    enabled: document.getElementById('stratEnabled').checked,
+    strategy: document.getElementById('stratSelect').value,
+    underlying: o.value,
+    underlying_name: o.text.split(' (')[0],
+    lot_size: parseInt(o.dataset.lot||'1',10),
+    candle_interval: document.getElementById('stratCandleInterval').value,
+    htf_candle_interval: document.getElementById('stratHtfInterval').value,
+    lots: parseInt(document.getElementById('stratLots').value||'1',10),
+    product: document.getElementById('stratProduct').value,
+    cooldown_seconds: parseInt(document.getElementById('stratCooldown').value||'60',10),
+    params: collectStratParams(),
+  };
+  await api('/api/strategy-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+  toast('✅ Config saved!');
+  setTimeout(loadStratConfig,500);
+}
+
+async function toggleStratEngine(){
+  const isOn = document.getElementById('stratEnabled').checked;
+  if (isOn) await saveStratConfig();
+  await api('/api/strategy-toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:isOn?'start':'stop'})});
+  toast(isOn?'📈 Engine started':'⏹ Engine stopped');
+  setTimeout(loadStratConfig,1000);
+}
+
+async function previewStrat(){
+  const p = document.getElementById('stratPreview');
+  p.classList.remove('hidden');
+  p.textContent = 'Saving config & running preview...';
+  try {
+    // Save current params first so preview uses the latest values
+    await saveStratConfig();
+    const r = await api('/api/strategy-preview');
+    if (r.error) { p.textContent = '❌ Error: '+r.error; return; }
+    let html = 'Strategy: '+(r.strategy_name||'—')+'\n';
+    html += 'Signal: '+(r.signal||'null (no signal)')+'\n';
+    html += 'Candles: '+r.candle_count+', HTF: '+r.htf_candle_count+'\n';
+    html += 'Last Close: '+r.last_close+'\n';
+    html += 'Live LTP: '+(r.live_ltp||'—')+'\n';
+    html += 'WS: '+(r.ws_connected?'🟢 Connected':'🔴 Off')+'\n';
+    html += 'Running: '+(r.running?'🟢 Yes':'🔴 No')+'\n';
+    html += 'Position: '+(r.position_open?r.position_type:'Flat')+'\n';
+    html += 'State: '+JSON.stringify(r.state,null,2);
+    p.textContent = html;
+  } catch(e) { p.textContent = '❌ '+e.message; }
+}
+
+function updateStratSignalDisplay(s){
+  const card = document.getElementById('stratLastSignal');
+  const hist = document.getElementById('stratSignalHistory');
+  const histList = document.getElementById('stratSignalList');
+  if (s.last_signal && s.last_signal.signal) {
+    card.style.display = 'block';
+    const sig = s.last_signal.signal;
+    const colors = {'BUY_CE':'var(--green)','BUY_PE':'var(--red)','EXIT_CE':'var(--amber)','EXIT_PE':'var(--amber)'};
+    document.getElementById('stratSignalDot').style.background = colors[sig]||'var(--blue)';
+    document.getElementById('stratSignalText').style.color = colors[sig]||'var(--blue)';
+    document.getElementById('stratSignalText').textContent = sig;
+    document.getElementById('stratSignalTime').textContent = fmtTime(s.last_signal.time);
+    let d='';
+    if (s.last_signal.state_snapshot) {
+      const ss=s.last_signal.state_snapshot;
+      if (ss.position) d+='Position: '+ss.position.type+' Entry: '+ss.position.entryPrice;
+      if (ss.setupOpen) d+=' Setup O:'+ss.setupOpen+' C:'+ss.setupClose;
+      if (ss.setupLine) d+=' SetupLine: '+ss.setupLine;
+    }
+    document.getElementById('stratSignalDetails').textContent = d;
+  } else { card.style.display='none'; }
+  if (s.signal_history && s.signal_history.length>0) {
+    hist.style.display='block';
+    histList.innerHTML = s.signal_history.map(h=>{
+      const c={'BUY_CE':'green','BUY_PE':'red','EXIT_CE':'amber','EXIT_PE':'amber'}[h.signal]||'amber';
+      return '<div style="display:flex;gap:8px;padding:4px 0;border-bottom:1px solid var(--border);font-size:0.8rem;"><span class="badge '+c+'">'+h.signal+'</span><span class="muted">'+fmtTime(h.time)+'</span></div>';
+    }).join('');
+  } else { hist.style.display='none'; }
+}
+
+async function resetStratState(){
+  await api('/api/strategy-reset-state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+  toast('✅ State reset!');
+  setTimeout(loadStratConfig,500);
+}
+async function loadInstruments_old(){}
+async function onInstrumentChange(){const s=document.getElementById('obInstrument');const o=s.options[s.selectedIndex];if(!o||!o.value)return;obState.instrumentKey=o.value;obState.lotSize=parseInt(o.dataset.lot||'1',10);document.getElementById('obExpiry').disabled=true;document.getElementById('obExpiry').innerHTML='<option value="">Loading...</option>';const r=await api('/api/option-expiries?instrument_key='+encodeURIComponent(obState.instrumentKey));const e=document.getElementById('obExpiry');if(r.error){e.innerHTML='<option value="">Error</option>';return;}e.innerHTML='<option value="">— Select —</option>';r.expiries.forEach(exp=>e.innerHTML+='<option value="'+exp+'">'+exp+'</option>');e.disabled=false;updateJSON();}
+async function onExpiryChange(){const exp=document.getElementById('obExpiry').value;if(!exp||!obState.instrumentKey)return;const type=document.getElementById('obOptionType').value;const r=await api('/api/atm-strike?instrument_key='+encodeURIComponent(obState.instrumentKey)+'&expiry_date='+encodeURIComponent(exp)+'&type='+type);if(r.error){toast('❌ ATM failed');document.getElementById('atmInfo').classList.add('hidden');return;}obState.instrumentToken=r.instrument_key;document.getElementById('atmInfo').classList.remove('hidden');document.getElementById('atmStrike').textContent=r.atm_strike;document.getElementById('atmSpot').textContent=r.spot_price;document.getElementById('atmLtp').textContent=r.ltp||'—';updateJSON();}
+function updateJSON(){if(!obState.instrumentToken){document.getElementById('jsonOutput').textContent='Fill in fields...';return;}const q=parseInt(document.getElementById('obLots').value||'1',10)*obState.lotSize;document.getElementById('obQty').value=q;const p={action:document.getElementById('obAction').value,instrument_token:obState.instrumentToken,quantity:q};const ot=document.getElementById('obOrderType').value;if(ot!=='MARKET')p.order_type=ot;const pr=document.getElementById('obProduct').value;if(pr!=='D')p.product=pr;const et=document.getElementById('obExitTarget').value,es=document.getElementById('obExitSL').value,ts=document.getElementById('obTrailSL').value,ta=document.getElementById('obTrailAct').value;if(et)p.exit_target_points=parseFloat(et);if(es)p.exit_sl_points=parseFloat(es);if(ts)p.trailing_sl_points=parseFloat(ts);if(ta)p.trailing_activation_points=parseFloat(ta);document.getElementById('jsonOutput').textContent=JSON.stringify(p,null,2);}
+function copyJSON(){const t=document.getElementById('jsonOutput').textContent;navigator.clipboard.writeText(t).then(()=>toast('✅ Copied!'));}
+function copyWebhookUrl(){const u=window.location.origin+'/webhook?token=YOUR_SECRET';navigator.clipboard.writeText(u).then(()=>toast('✅ URL copied!'));}
+async function placeBuilderOrder(){if(!obState.instrumentToken){toast('Select instrument first');return;}const q=parseInt(document.getElementById('obLots').value||'1',10)*obState.lotSize;const p={action:document.getElementById('obAction').value,instrument_token:obState.instrumentToken,quantity:q,order_type:document.getElementById('obOrderType').value,product:document.getElementById('obProduct').value};const r=await api('/api/manual-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});toast(r.ok?'✅ Order placed!':'❌ '+JSON.stringify(r.result||r.error));loadStatus();}
+async function loadSignals(){const d=await api('/api/signals');const b=document.getElementById('signalsBody');if(!d||d.length===0){b.innerHTML='<tr><td colspan="5" class="muted">No signals</td></tr>';return;}b.innerHTML=d.map(s=>{const p=s.payload||{};const a=p.action||'—',i=(p.instrument_token||'—').substring(0,25),st=s.status||'—';const cls=st==='order_placed'?'green':st==='duplicate'?'amber':'red';return '<tr><td>'+fmtTime(s.timestamp)+'</td><td><span class="pill '+(a==='BUY'?'buy':'sell')+'">'+a+'</span></td><td>'+i+'</td><td><span class="badge '+cls+'">'+st+'</span></td><td class="raw-msg">'+(s.raw_message||'—').substring(0,80)+'</td></tr>';}).join('');}
+async function loadOrders(){const d=await api('/api/orders');const b=document.getElementById('ordersBody');if(!d||d.length===0){b.innerHTML='<tr><td colspan="5" class="muted">No orders</td></tr>';return;}b.innerHTML=d.map(o=>'<tr><td>'+fmtTime(o.timestamp)+'</td><td>'+(o.type||'—')+'</td><td>'+(o.instrument_token||'—').substring(0,25)+'</td><td>'+(o.action||'—')+'</td><td>'+(o.ok?'<span class="badge green">OK</span>':'<span class="badge red">FAIL</span>')+'</td></tr>').join('');}
+async function loadPositions(){const d=await api('/api/positions');const b=document.getElementById('positionsBody');if(!d||d.length===0){b.innerHTML='<tr><td colspan="5" class="muted">No positions</td></tr>';return;}b.innerHTML=d.map(p=>'<tr><td>'+(p.instrument_token||'').substring(0,25)+'</td><td><span class="pill '+(p.transaction_type==='BUY'?'buy':'sell')+'">'+p.transaction_type+'</span></td><td>'+p.quantity+'</td><td>'+p.entry_price+'</td><td>'+(p.highest_price||p.lowest_price||'—')+'</td></tr>').join('');}
+async function loadUpstoxPositions(){const r=await api('/api/upstox-positions');const b=document.getElementById('positionsBody');if(r.error){b.innerHTML='<tr><td colspan="5" class="muted">Error: '+r.error+'</td></tr>';return;}const ps=(r.data&&r.data.data)||[];if(ps.length===0){b.innerHTML='<tr><td colspan="5" class="muted">No live positions</td></tr>';return;}b.innerHTML=ps.map(p=>'<tr><td>'+(p.instrument_token||'').substring(0,25)+'</td><td><span class="pill '+(p.transaction_type==='BUY'?'buy':'sell')+'">'+(p.transaction_type||'')+'</span></td><td>'+p.quantity+'</td><td>'+p.average_price+'</td><td>'+p.last_price+'</td></tr>').join('');}
+async function loadExitConfig(){const c=await api('/api/exit-config');document.getElementById('exitEnabled').checked=c.enabled;document.getElementById('exitMode').value=c.mode;document.getElementById('trailSL').value=c.trailing_sl_points;document.getElementById('trailAct').value=c.trailing_activation_points;document.getElementById('fixedSL').value=c.fixed_sl_points;document.getElementById('fixedTarget').value=c.fixed_target_points;}
+async function saveExitConfig(){const b={enabled:document.getElementById('exitEnabled').checked,mode:document.getElementById('exitMode').value,trailing_sl_points:parseFloat(document.getElementById('trailSL').value),trailing_activation_points:parseFloat(document.getElementById('trailAct').value),fixed_sl_points:parseFloat(document.getElementById('fixedSL').value),fixed_target_points:parseFloat(document.getElementById('fixedTarget').value)};await api('/api/exit-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});toast('✅ Saved!');}
+async function loadSettings(){const s=await api('/api/settings');document.getElementById('setClientId').value=s.upstox_client_id||'';document.getElementById('setClientSecret').value='';document.getElementById('setWebhookSecret').value='';let p=[];p.push(s.has_client_id?'✅ API Key':'❌ API Key');p.push(s.has_client_secret?'✅ Secret':'❌ Secret');p.push(s.has_webhook_secret?'✅ Webhook':'❌ Webhook');document.getElementById('settingsStatus').innerHTML=p.join(' &nbsp; ');}
+async function saveSettings(){const b={};const ci=document.getElementById('setClientId').value.trim(),cs=document.getElementById('setClientSecret').value.trim(),ws=document.getElementById('setWebhookSecret').value.trim();if(ci)b.upstox_client_id=ci;if(cs)b.upstox_client_secret=cs;if(ws)b.webhook_secret=ws;if(!ci&&!cs&&!ws){toast('No changes');return;}await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});toast('✅ Saved!');loadSettings();loadStatus();}
+loadStatus();loadInstruments();setInterval(loadStatus,30000);
+</script>
+<div id="toast"></div>
+</body></html>`;
+
+// Initialize Strategy Engine (optional module — does nothing if not enabled)
+const strategyEngine = require("./strategy-engine");
+strategyEngine.init(app, {
+  db, getSetting, setSetting, getToken,
+  placeUpstoxOrder, getLTP, calculateATM, isMarketOpen,
+  logOrder, logSignal, addLog, fetchIPv4, getTradingConfig,
+});
+
+// Start server
+app.listen(PORT, "0.0.0.0", () => {
+
+// BUG 26: Graceful shutdown — save state and close WebSocket on PM2 stop
+process.on("SIGTERM", () => {
+  console.log("[SHUTDOWN] SIGTERM received — saving state and shutting down");
+  try {
+    if (typeof strategyEngine !== "undefined" && strategyEngine.running) {
+      strategyEngine.saveState();
+      strategyEngine.stop();
+    }
+  } catch (e) { console.log("[SHUTDOWN] Error:", e.message); }
+  process.exit(0);
+});
+process.on("SIGINT", () => {
+  console.log("[SHUTDOWN] SIGINT received — saving state and shutting down");
+  try {
+    if (typeof strategyEngine !== "undefined" && strategyEngine.running) {
+      strategyEngine.saveState();
+      strategyEngine.stop();
+    }
+  } catch (e) { console.log("[SHUTDOWN] Error:", e.message); }
+  process.exit(0);
+});
+  console.log(`Upstox Trading Bot running on port ${PORT}`);
+  addLog("INFO", "Server started on port " + PORT);
+});

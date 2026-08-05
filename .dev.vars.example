@@ -1,0 +1,17 @@
+# Local dev secrets — copy to .dev.vars and fill in.
+# NEVER commit the real .dev.vars file.
+#
+#   cp .dev.vars.example .dev.vars
+#   wrangler dev
+#
+# In production, set these with `wrangler secret put` instead.
+
+# Any random string you choose. Used to authenticate TradingView webhook calls.
+# Pass it as ?token=... in the TradingView webhook URL.
+WEBHOOK_SECRET=change-me-to-a-long-random-string
+
+# Your Upstox Developer App credentials (from https://developer.upstox.com).
+# These are set as secrets in production:
+#   wrangler secret put UPSTOX_CLIENT_SECRET
+UPSTOX_CLIENT_ID=your-upstox-api-key
+UPSTOX_CLIENT_SECRET=your-upstox-api-secret

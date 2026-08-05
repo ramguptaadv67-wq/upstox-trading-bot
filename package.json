@@ -1,0 +1,14 @@
+{
+  "name": "upstox-tv-webhook",
+  "version": "3.0.0",
+  "description": "Cloudflare Worker: place Upstox orders from TradingView webhook alerts — with dashboard, trailing stop-loss, exit engine, and Order Builder with option chain",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

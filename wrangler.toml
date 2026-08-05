@@ -1,0 +1,35 @@
+name = "upstox-tv-webhook"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+# ---------------------------------------------------------------------------
+# KV Namespace — stores the Upstox access token, signal/order logs, exit config,
+# kill switch, and tracked positions.
+# Create it first:  wrangler kv:namespace create UPSTOX_KV
+# Then paste the id below.
+# ---------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "UPSTOX_KV"
+id = "6243b3b341ed47f0bcc8e7478e0212dc"
+preview_id = "6243b3b341ed47f0bcc8e7478e0212dc"
+
+# ---------------------------------------------------------------------------
+# Cron Triggers
+#   1) 9:10 AM IST (03:40 UTC) Mon–Fri → request new Upstox access token
+#      (you approve the push notification; Upstox POSTs token to /notifier)
+#   2) Every minute → exit engine checks trailing SL / fixed SL / target
+#      (only acts during NSE market hours, checked in code)
+# Note: the free Workers plan allows up to 3 cron triggers.
+# ---------------------------------------------------------------------------
+[triggers]
+crons = ["40 3 * * 1-5", "* * * * *"]
+
+# ---------------------------------------------------------------------------
+# Non-secret config (secrets are set via `wrangler secret put`).
+# ---------------------------------------------------------------------------
+[vars]
+UPSTOX_CLIENT_ID = "a97d9aad-d04c-4dd7-9c2b-72bcd1f08bb4"
+
+# Secrets — set with:
+#   wrangler secret put WEBHOOK_SECRET
+#   wrangler secret put UPSTOX_CLIENT_SECRET

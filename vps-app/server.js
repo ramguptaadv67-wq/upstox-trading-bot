@@ -1266,14 +1266,14 @@ async function previewStrat(){
     await saveStratConfig();
     const r = await api('/api/strategy-preview');
     if (r.error) { p.textContent = '❌ Error: '+r.error; return; }
-    let html = 'Strategy: '+(r.strategy_name||'—')+'\n';
-    html += 'Signal: '+(r.signal||'null (no signal)')+'\n';
-    html += 'Candles: '+r.candle_count+', HTF: '+r.htf_candle_count+'\n';
-    html += 'Last Close: '+r.last_close+'\n';
-    html += 'Live LTP: '+(r.live_ltp||'—')+'\n';
-    html += 'WS: '+(r.ws_connected?'🟢 Connected':'🔴 Off')+'\n';
-    html += 'Running: '+(r.running?'🟢 Yes':'🔴 No')+'\n';
-    html += 'Position: '+(r.position_open?r.position_type:'Flat')+'\n';
+    let html = 'Strategy: '+(r.strategy_name||'—')+'\\n';
+    html += 'Signal: '+(r.signal||'null (no signal)')+'\\n';
+    html += 'Candles: '+r.candle_count+', HTF: '+r.htf_candle_count+'\\n';
+    html += 'Last Close: '+r.last_close+'\\n';
+    html += 'Live LTP: '+(r.live_ltp||'—')+'\\n';
+    html += 'WS: '+(r.ws_connected?'🟢 Connected':'🔴 Off')+'\\n';
+    html += 'Running: '+(r.running?'🟢 Yes':'🔴 No')+'\\n';
+    html += 'Position: '+(r.position_open?r.position_type:'Flat')+'\\n';
     html += 'State: '+JSON.stringify(r.state,null,2);
     p.textContent = html;
   } catch(e) { p.textContent = '❌ '+e.message; }

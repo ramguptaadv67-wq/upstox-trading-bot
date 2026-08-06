@@ -869,7 +869,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Upstox Trading Bot — Dashboard</title>
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Upstox Bot v3 FIXED — Dashboard</title>
 <style>
 :root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;--green:#3fb950;--red:#f85149;--amber:#d29922;--blue:#58a6ff;--green-bg:rgba(63,185,80,0.1);--red-bg:rgba(248,81,73,0.1);--amber-bg:rgba(210,153,34,0.1)}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1124,6 +1127,8 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 </div>
 
 <script>
+window.onerror=function(msg,url,line,col,err){document.body.insertAdjacentHTML('afterbegin','<div style="background:red;color:white;padding:16px;font-size:14px;position:fixed;top:0;left:0;right:0;z-index:9999">JS ERROR: '+msg+' (line '+line+')</div>');return false;};
+document.addEventListener('DOMContentLoaded',function(){document.title=document.title;var d=document.createElement('div');d.id='jsCheck';d.style.cssText='position:fixed;bottom:0;left:0;background:green;color:white;padding:4px 8px;font-size:10px;z-index:9999';d.textContent='JS OK v3';document.body.appendChild(d);});
 const api=async(p,o)=>{try{const r=await fetch(p,o);if(!r.ok){console.error('API error:',r.status,p);return{error:'HTTP '+r.status};}return await r.json();}catch(e){console.error('API fetch error:',e.message,p);return{error:e.message};}};
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',3500);}
 function fmtTime(ts){return ts?new Date(ts).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:false}):'—';}

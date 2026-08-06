@@ -1086,7 +1086,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   <p class="muted" style="margin-bottom:12px;">Runs the selected strategy over historical candles and shows entry, exit, and P&L in points.</p>
   <div class="form-row" style="align-items:center;">
     <div style="flex:2"><label>Strategy (uses saved config)</label><select id="btStrategy" disabled></select></div>
-    <div><label>Interval</label><select id="btInterval"><option value="1m">1 min</option><option value="3m" selected>3 min</option><option value="5m">5 min</option><option value="15m">15 min</option><option value="30m">30 min</option></select></div>
+    <div><label>Interval</label><select id="btInterval"><option value="1m">1 min</option><option value="3m">3 min</option><option value="5m" selected>5 min</option><option value="15m">15 min</option><option value="30m">30 min</option></select></div>
     <button class="btn btn-primary" onclick="runBacktest()" style="margin-top:18px;">▶ Run Backtest</button>
   </div>
   <div id="btStatus" class="muted" style="margin-top:10px;"></div>

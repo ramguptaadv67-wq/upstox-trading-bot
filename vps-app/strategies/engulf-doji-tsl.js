@@ -70,8 +70,8 @@ function run(candles, htfCandles, state, params, helpers) {
     state.setupType = "bear";
   }
 
-  // === Doji Detection ===
-  const isDoji = body <= p.dojiBodyMax && cur.high - cur.low >= body * 2;
+  // === Doji Detection (matches Pine Script: body <= doji_body_max AND (high-low) >= body()*2) ===
+  const isDoji = body <= p.dojiBodyMax && (cur.high - cur.low) >= body * 2;
   const valid = state.setupLine !== null;
   const touchesLine = valid && cur.high >= state.setupLine && cur.low <= state.setupLine;
   const greenDoji = isDoji && cur.close > cur.open;

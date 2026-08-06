@@ -1,0 +1,27 @@
+#!/bin/bash
+echo "=== DIAGNOSTIC ==="
+echo ""
+echo "1. What PM2 is running:"
+pm2 describe upstox-bot 2>/dev/null | grep -E "script path|uptime|status" || echo "NOT RUNNING"
+echo ""
+echo "2. Does server.js have the new version marker?"
+grep -c "v3 FIXED" /var/www/upstox-bot/server.js 2>/dev/null && echo "YES - new code present" || echo "NO - old code still on disk"
+echo ""
+echo "3. Does server.js have the catch fix?"
+grep -c "catch(e){console.error('loadInstruments" /var/www/upstox-bot/server.js 2>/dev/null && echo "YES - catch fix present" || echo "NO - catch fix missing"
+echo ""
+echo "4. What title is the live page serving?"
+curl -s http://127.0.0.1:3000/ | grep -o '<title>[^<]*</title>'
+echo ""
+echo "5. Does the live page have the JS OK badge?"
+curl -s http://127.0.0.1:3000/ | grep -c "jsCheck" && echo "YES - new JS with error handler" || echo "NO - serving old HTML"
+echo ""
+echo "6. Is tradetron-tsl.js still on disk?"
+ls /var/www/upstox-bot/strategies/tradetron-tsl.js 2>/dev/null && echo "YES - still there" || echo "NO - removed"
+echo ""
+echo "7. Token status:"
+curl -s http://127.0.0.1:3000/api/token-status
+echo ""
+echo ""
+echo "8. PM2 logs (last 10 lines):"
+pm2 logs upstox-bot --lines 10 --nostream 2>&1

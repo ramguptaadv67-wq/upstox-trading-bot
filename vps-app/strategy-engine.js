@@ -306,6 +306,101 @@ class StrategyEngine {
       this.positionToken = null; this.positionQty = null; this.positionProduct = null;
       res.json({ status: "reset" });
     });
+
+    // ==================== BACKTEST ====================
+    app.get("/api/strategy-backtest", async (req, res) => {
+      try {
+        const cfg = this.getConfig();
+        const { token, expiry } = await this.getToken();
+        if (!token || Date.now() >= expiry) return res.json({ error: "no_token" });
+
+        const interval = req.query.interval || cfg.candle_interval || "3m";
+        const underlying = req.query.underlying || cfg.underlying;
+
+        const candles = await fetchCandles(this.fetchIPv4, token, underlying, interval);
+        if (!candles || candles.length < 5) return res.json({ error: "no_candle_data" });
+
+        let htfCandles = null;
+        const strat = this.strategies[cfg.strategy];
+        if (strat && strat.needsHtf && cfg.htf_candle_interval && cfg.htf_candle_interval !== interval) {
+          htfCandles = await fetchCandles(this.fetchIPv4, token, underlying, cfg.htf_candle_interval);
+        }
+        if (!strat) return res.json({ error: "Strategy not found: " + cfg.strategy });
+
+        const paramsObj = {};
+        for (const k in strat.params) paramsObj[k] = { ...strat.params[k], value: cfg.params[k] !== undefined ? cfg.params[k] : strat.params[k].value };
+
+        const btState = {};
+        const trades = [];
+        let currentTrade = null;
+
+        for (let i = 1; i < candles.length; i++) {
+          const slice = candles.slice(0, i + 1);
+          const htfSlice = htfCandles ? htfCandles.filter(c => c.timestamp <= slice[slice.length - 1].timestamp) : null;
+          let signal;
+          try { signal = strat.run(slice, htfSlice, btState, paramsObj, HELPERS); } catch (e) { signal = null; }
+
+          const c = candles[i];
+          if (signal === "BUY_CE" && !currentTrade) {
+            currentTrade = { type: "CE", entryIdx: i, entryPrice: c.close, entryTime: c.timestamp };
+          } else if (signal === "BUY_PE" && !currentTrade) {
+            currentTrade = { type: "PE", entryIdx: i, entryPrice: c.close, entryTime: c.timestamp };
+          } else if (signal === "EXIT_CE" && currentTrade && currentTrade.type === "CE") {
+            const exitPrice = c.close;
+            const pnl = exitPrice - currentTrade.entryPrice;
+            trades.push({ ...currentTrade, exitIdx: i, exitPrice, exitTime: c.timestamp, pnl });
+            currentTrade = null;
+          } else if (signal === "EXIT_PE" && currentTrade && currentTrade.type === "PE") {
+            const exitPrice = c.close;
+            const pnl = currentTrade.entryPrice - exitPrice;
+            trades.push({ ...currentTrade, exitIdx: i, exitPrice, exitTime: c.timestamp, pnl });
+            currentTrade = null;
+          }
+        }
+        // Close any open trade at last candle
+        if (currentTrade) {
+          const lastC = candles[candles.length - 1];
+          const pnl = currentTrade.type === "CE" ? lastC.close - currentTrade.entryPrice : currentTrade.entryPrice - lastC.close;
+          trades.push({ ...currentTrade, exitIdx: candles.length - 1, exitPrice: lastC.close, exitTime: lastC.timestamp, pnl, note: "open_at_end" });
+        }
+
+        const wins = trades.filter(t => t.pnl > 0);
+        const losses = trades.filter(t => t.pnl <= 0);
+        const totalPnl = trades.reduce((s, t) => s + t.pnl, 0);
+        const avgPnl = trades.length > 0 ? totalPnl / trades.length : 0;
+        const winRate = trades.length > 0 ? (wins.length / trades.length) * 100 : 0;
+        const maxWin = wins.length > 0 ? Math.max(...wins.map(t => t.pnl)) : 0;
+        const maxLoss = losses.length > 0 ? Math.min(...losses.map(t => t.pnl)) : 0;
+
+        res.json({
+          strategy: cfg.strategy,
+          strategy_name: strat.name,
+          interval,
+          underlying,
+          candle_count: candles.length,
+          total_trades: trades.length,
+          wins: wins.length,
+          losses: losses.length,
+          win_rate: winRate.toFixed(1),
+          total_pnl: totalPnl.toFixed(2),
+          avg_pnl: avgPnl.toFixed(2),
+          max_win: maxWin.toFixed(2),
+          max_loss: maxLoss.toFixed(2),
+          trades: trades.map(t => ({
+            type: t.type,
+            entry_price: t.entryPrice.toFixed(2),
+            exit_price: t.exitPrice.toFixed(2),
+            entry_time: new Date(t.entryTime).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }),
+            exit_time: new Date(t.exitTime).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }),
+            pnl: parseFloat(t.pnl.toFixed(2)),
+            note: t.note || "",
+          })),
+        });
+      } catch (e) {
+        console.log("[STRATEGY] Backtest error: " + e.message);
+        res.json({ error: e.message });
+      }
+    });
   }
 
   // ==================== STRATEGY EXECUTION ====================

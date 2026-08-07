@@ -7,6 +7,40 @@ const http = require("http");
 const https = require("https");
 
 const app = express();
+// --- Security headers ---
+app.disable("x-powered-by");
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  next();
+});
+// --- Dashboard authentication ---
+function dashAuth(req, res, next) {
+  // Skip auth for webhook (has its own token auth) and notifier
+  if (req.path === "/webhook" || req.path === "/notifier") return next();
+  // Check if password is set
+  const dashPass = getSetting("DASHBOARD_PASSWORD", "");
+  if (!dashPass) return next(); // No password set = open (user can set one in Settings)
+  // Check session cookie
+  const cookie = req.headers.cookie || "";
+  const match = cookie.match(/dash_auth=([^;]+)/);
+  if (match && match[1] === dashPass) return next();
+  // Check bearer token
+  const auth = req.headers.authorization || "";
+  if (auth.startsWith("Bearer ") && auth.substring(7) === dashPass) return next();
+  // Not authenticated
+  if (req.path.startsWith("/api/")) {
+    return res.status(401).json({ error: "Authentication required. Set DASHBOARD_PASSWORD." });
+  }
+  // Show login page for HTML requests
+  res.send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Horse Engine — Login</title><style>body{background:#0d1117;color:#e6edf3;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}form{text-align:center}input{padding:12px;width:200px;background:#161b22;border:1px solid #30363d;color:#e6edf3;border-radius:6px;font-size:16px}button{padding:12px 20px;margin-top:8px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:16px;cursor:pointer}h1{color:#58a6ff;margin-bottom:20px}a{color:#58a6ff;font-size:12px}</style></head><body><form onsubmit="let p=document.getElementById('pw').value;document.cookie='dash_auth='+p+';path=/;max-age=86400';location.reload()"><h1>🐎 Horse Engine</h1><input type="password" id="pw" placeholder="Enter password" autofocus><br><button type="submit">Login</button></form></body></html>`);
+}
+
+
+app.set("trust proxy", 1);
 const PORT = 3000;
 const DB_PATH = path.join(__dirname, "data.db");
 
@@ -215,23 +249,6 @@ app.get("/api/webhook-url", (req, res) => {
   const ws = getSetting("WEBHOOK_SECRET", "");
   const url = ws ? `${req.protocol}://${req.get("host")}/webhook?token=${ws}` : "";
   res.json({ url, has_secret: !!ws });
-});
-
-// --- Debug endpoint to check credential status (masked) ---
-app.get("/api/debug-creds", (req, res) => {
-  const cid = getSetting("UPSTOX_CLIENT_ID", "");
-  const cs = getSetting("UPSTOX_CLIENT_SECRET", "");
-  const ws = getSetting("WEBHOOK_SECRET", "");
-  res.json({
-    client_id_present: !!cid,
-    client_id_length: cid.length,
-    client_id_preview: cid ? cid.substring(0, 8) + "..." : "(empty)",
-    client_secret_present: !!cs,
-    client_secret_length: cs.length,
-    webhook_secret_present: !!ws,
-    db_path: DB_PATH,
-    timestamp: new Date().toISOString(),
-  });
 });
 
 // --- Upstox API ---
@@ -519,9 +536,36 @@ app.get("/", (req, res) => {
   res.send(DASHBOARD_HTML);
 });
 
+// --- Rate limiting (in-memory, no dependency needed) ---
+const _rateBuckets = {};
+const RATE_WINDOW = 60000; // 1 minute
+const RATE_MAX_API = 60; // 60 requests/min for API
+const RATE_MAX_WEBHOOK = 30; // 30 requests/min for webhook
+function rateLimit(key, max) {
+  const now = Date.now();
+  const bucket = _rateBuckets[key] || { count: 0, reset: now + RATE_WINDOW };
+  if (now > bucket.reset) { bucket.count = 0; bucket.reset = now + RATE_WINDOW; }
+  bucket.count++;
+  _rateBuckets[key] = bucket;
+  return bucket.count <= max;
+}
+// Rate limit API endpoints
+app.use("/api/", (req, res, next) => {
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  if (!rateLimit("api:" + ip, RATE_MAX_API)) {
+    return res.status(429).json({ error: "Too many requests. Slow down." });
+  }
+  next();
+});
+
 // Webhook receiver — accepts {"action":"BUY"}, plain "BUY", or TradingView {{strategy.order.action}}
 // Bot uses saved Trading Config to determine instrument, strike, qty, exits
 app.post("/webhook", async (req, res) => {
+  // Rate limit webhook
+  const wip = req.ip || req.socket.remoteAddress || "unknown";
+  if (!rateLimit("webhook:" + wip, RATE_MAX_WEBHOOK)) {
+    return res.status(429).json({ status: "error", message: "Too many webhook requests. Slow down." });
+  }
   // Capture raw body regardless of content type
   let rawText = "";
   if (typeof req.body === "string") {
@@ -938,6 +982,7 @@ app.post("/api/settings", (req, res) => {
   if (req.body.upstox_client_id) setSetting("UPSTOX_CLIENT_ID", req.body.upstox_client_id);
   if (req.body.upstox_client_secret) setSetting("UPSTOX_CLIENT_SECRET", req.body.upstox_client_secret);
   if (req.body.webhook_secret) setSetting("WEBHOOK_SECRET", req.body.webhook_secret);
+    if (req.body.dash_pass) setSetting("DASHBOARD_PASSWORD", req.body.dash_pass);
   res.json({ status: "saved" });
 });
 
@@ -1310,6 +1355,9 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
     <div style="flex:2"><label>Upstox API Secret</label><input id="setClientSecret" type="password" placeholder="Enter new secret"></div>
   </div>
   <div class="form-row">
+    <div style="flex:2"><label>Dashboard Password (optional)</label><input id="setDashPass" type="password" placeholder="Set password to protect dashboard"></div>
+  </div>
+  <div class="form-row">
     <div style="flex:2"><label>Webhook Secret</label><input id="setWebhookSecret" type="password" placeholder="Enter new webhook secret"></div>
   </div>
   <div class="form-row" style="margin-top:10px;">
@@ -1557,6 +1605,14 @@ strategyEngine.init(app, {
 });
 
 // Start server
+
+// --- Error handler (no stack trace leakage) ---
+app.use((err, req, res, next) => {
+  console.error("[ERROR]", err.message);
+  addLog("ERROR", err.message);
+  res.status(500).json({ error: "Internal server error" });
+});
+
 app.listen(PORT, "0.0.0.0", () => {
 
 // BUG 26: Graceful shutdown — save state and close WebSocket on PM2 stop

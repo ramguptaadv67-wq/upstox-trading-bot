@@ -153,18 +153,29 @@ function getExitConfig() {
 
 // --- Trading Config (what the bot buys when it gets a webhook signal) ---
 const DEFAULT_TRADING_CONFIG = {
-  underlying: "NSE_INDEX|Nifty 50",  // instrument key of underlying
+  underlying: "NSE_INDEX|Nifty 50",
   underlying_name: "NIFTY 50",
   lot_size: 65,
-  option_type: "CE",                // CE or PE
-  lots: 1,                          // number of lots
-  product: "D",                     // D (Delivery) or I (Intraday)
-  // Exit conditions for webhook-placed orders
+  option_type: "CE",                // CE or PE (default leg)
+  lots: 1,
+  product: "D",
   exit_target_points: 40,
   exit_sl_points: 25,
   trailing_sl_points: 15,
   trailing_activation_points: 10,
-  use_exit: true,                   // whether to track exits for webhook orders
+  use_exit: true,
+  // --- CE leg (Buy CE alerts) ---
+  ce_enabled: true,
+  ce_lots: 1,
+  ce_product: "D",
+  ce_exit_target_points: 40,
+  ce_exit_sl_points: 25,
+  // --- PE leg (Buy PE alerts) ---
+  pe_enabled: true,
+  pe_lots: 1,
+  pe_product: "D",
+  pe_exit_target_points: 40,
+  pe_exit_sl_points: 25,
 };
 
 function getTradingConfig() {
@@ -540,10 +551,26 @@ app.post("/webhook", async (req, res) => {
     return res.json({ status: "error", message: "unauthorized" });
   }
 
-  let action = String(payload.action || payload.side || payload.transaction_type || payload.data || "").toUpperCase().trim();
+  let action = String(payload.action || payload.side || payload.transaction_type || payload.data || payload.signal || "").toUpperCase().trim();
+
+  // Support buy_ce / buy_pe / sell_ce / sell_pe alert formats from TradingView
+  let forcedOptionType = null;
+  const actionLower = action.toLowerCase();
+  if (actionLower === "buy_ce" || actionLower === "buyce" || actionLower === "ce") {
+    action = "BUY"; forcedOptionType = "CE";
+    console.log("[WEBHOOK] Detected BUY_CE alert — using CE leg config");
+  } else if (actionLower === "buy_pe" || actionLower === "buype" || actionLower === "pe") {
+    action = "BUY"; forcedOptionType = "PE";
+    console.log("[WEBHOOK] Detected BUY_PE alert — using PE leg config");
+  } else if (actionLower === "sell_ce" || actionLower === "sellce") {
+    action = "SELL"; forcedOptionType = "CE";
+  } else if (actionLower === "sell_pe" || actionLower === "sellpe") {
+    action = "SELL"; forcedOptionType = "PE";
+  }
+
   if (!["BUY", "SELL"].includes(action)) {
     logSignal(rawText.substring(0, 1000), payload, "invalid_action");
-    return res.json({ status: "error", message: `invalid action: "${action}". Send {"action":"BUY"} or {"action":"SELL"}` });
+    return res.json({ status: "error", message: `invalid action: "${action}". Send {"action":"BUY"} or {"action":"buy_ce"} or {"action":"buy_pe"}` });
   }
 
   const killSwitch = getSetting("kill_switch", "off") === "on";
@@ -572,6 +599,7 @@ app.post("/webhook", async (req, res) => {
   const payloadInstrument = payload.instrument_token || payload.ticker || payload.symbol || payload.instrument_key || "";
 
   let instrumentToken, quantity, entryPrice;
+  let legOptionType = forcedOptionType;
 
   if (payloadInstrument) {
     // MODE 1: Payload has instrument_token — use it directly (backwards compatible)
@@ -580,18 +608,38 @@ app.post("/webhook", async (req, res) => {
     entryPrice = await getLTP(token, instrumentToken);
     console.log(`[WEBHOOK] Mode 1: Direct instrument ${instrumentToken}, qty ${quantity}`);
   } else {
-    // MODE 2: Auto-ATM from saved Trading Config
+    // MODE 2: Auto-ATM from saved Trading Config (CE leg or PE leg)
     const tcfg = getTradingConfig();
-    console.log(`[WEBHOOK] Mode 2: Auto-ATM for ${tcfg.underlying_name} ${tcfg.option_type}`);
-    const atm = await calculateATM(token, tcfg.underlying, tcfg.option_type, null);
+    if (!legOptionType) legOptionType = tcfg.option_type || "CE";
+
+    // Pick leg-specific config
+    let legLots, legProduct, legExitTarget, legExitSL;
+    if (legOptionType === "CE") {
+      legLots = tcfg.ce_lots ?? tcfg.lots ?? 1;
+      legProduct = tcfg.ce_product ?? tcfg.product ?? "D";
+      legExitTarget = tcfg.ce_exit_target_points ?? tcfg.exit_target_points ?? 40;
+      legExitSL = tcfg.ce_exit_sl_points ?? tcfg.exit_sl_points ?? 25;
+    } else {
+      legLots = tcfg.pe_lots ?? tcfg.lots ?? 1;
+      legProduct = tcfg.pe_product ?? tcfg.product ?? "D";
+      legExitTarget = tcfg.pe_exit_target_points ?? tcfg.exit_target_points ?? 40;
+      legExitSL = tcfg.pe_exit_sl_points ?? tcfg.exit_sl_points ?? 25;
+    }
+
+    console.log(`[WEBHOOK] Mode 2: Auto-ATM for ${tcfg.underlying_name} ${legOptionType} (leg: ${legLots} lots, ${legProduct})`);
+    const atm = await calculateATM(token, tcfg.underlying, legOptionType, null);
     if (!atm) {
       logSignal(rawText.substring(0, 1000), payload, "atm_calc_failed");
       return res.json({ status: "error", message: "Failed to calculate ATM strike. Check trading config." });
     }
     instrumentToken = atm.instrument_key;
-    quantity = parseInt(tcfg.lots, 10) * parseInt(tcfg.lot_size, 10);
+    quantity = parseInt(legLots, 10) * parseInt(tcfg.lot_size, 10);
     entryPrice = atm.spot;
-    console.log(`[WEBHOOK] ATM: ${atm.atm_strike} ${tcfg.option_type} (spot ${atm.spot}), token ${instrumentToken}, qty ${quantity}`);
+    // Override payload exit values with leg-specific values for exit tracking
+    payload.exit_target_points = legExitTarget;
+    payload.exit_sl_points = legExitSL;
+    payload.product = legProduct;
+    console.log(`[WEBHOOK] ATM: ${atm.atm_strike} ${legOptionType} (spot ${atm.spot}), token ${instrumentToken}, qty ${quantity}`);
   }
 
   let result;
@@ -1000,22 +1048,42 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 
 <div id="tab-auto" class="card hidden">
   <h2>🤖 Auto Trade Config</h2>
-  <p class="muted" style="margin-bottom:12px;">When a TradingView webhook sends {"action":"BUY"}, the bot uses these settings to auto-select ATM strike, quantity, and exit conditions. No need to specify instrument in the webhook message.</p>
+  <p class="muted" style="margin-bottom:12px;">When a TradingView webhook sends <code>{"action":"buy_ce"}</code> or <code>{"action":"buy_pe"}</code>, the bot uses these settings to auto-select ATM strike, quantity, and exit conditions for each leg independently.</p>
   <div class="form-row">
     <div style="flex:2"><label>1. Underlying</label><select id="tcUnderlying" onchange="onTcInstrumentChange()"></select></div>
-    <div><label>2. Option Type</label><select id="tcOptionType"><option value="CE">CE (Call)</option><option value="PE">PE (Put)</option></select></div>
-  </div>
-  <div class="form-row">
-    <div><label>3. Lots</label><input id="tcLots" type="number" value="1" min="1"></div>
     <div><label>Qty (auto)</label><input id="tcQty" type="number" readonly style="opacity:.6"></div>
-    <div><label>4. Product</label><select id="tcProduct"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
   </div>
   <div class="section-divider"></div>
-  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Exit Conditions (applied to webhook orders)</h2>
-  <div class="form-row">
-    <div><label>Exit Target (pts)</label><input id="tcExitTarget" type="number" value="40"></div>
-    <div><label>Exit SL (pts)</label><input id="tcExitSL" type="number" value="25"></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+    <div style="background:var(--bg);border:1px solid var(--green);border-radius:8px;padding:12px;">
+      <h3 style="color:var(--green);margin-bottom:8px;font-size:0.95rem;">🟢 CE Leg (Buy CE alerts)</h3>
+      <div class="form-row" style="align-items:center;margin-bottom:8px;">
+        <label class="toggle"><input type="checkbox" id="tcCeEnabled" checked><span class="slider"></span></label>
+        <span style="margin-left:8px;font-weight:600;">Enable CE leg</span>
+      </div>
+      <div><label>Lots</label><input id="tcCeLots" type="number" value="1" min="1"></div>
+      <div style="margin-top:6px;"><label>Product</label><select id="tcCeProduct"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
+      <div class="form-row" style="margin-top:6px;">
+        <div><label>Exit Target (pts)</label><input id="tcCeExitTarget" type="number" value="40"></div>
+        <div><label>Exit SL (pts)</label><input id="tcCeExitSL" type="number" value="25"></div>
+      </div>
+    </div>
+    <div style="background:var(--bg);border:1px solid var(--red);border-radius:8px;padding:12px;">
+      <h3 style="color:var(--red);margin-bottom:8px;font-size:0.95rem;">🔴 PE Leg (Buy PE alerts)</h3>
+      <div class="form-row" style="align-items:center;margin-bottom:8px;">
+        <label class="toggle"><input type="checkbox" id="tcPeEnabled" checked><span class="slider"></span></label>
+        <span style="margin-left:8px;font-weight:600;">Enable PE leg</span>
+      </div>
+      <div><label>Lots</label><input id="tcPeLots" type="number" value="1" min="1"></div>
+      <div style="margin-top:6px;"><label>Product</label><select id="tcPeProduct"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
+      <div class="form-row" style="margin-top:6px;">
+        <div><label>Exit Target (pts)</label><input id="tcPeExitTarget" type="number" value="40"></div>
+        <div><label>Exit SL (pts)</label><input id="tcPeExitSL" type="number" value="25"></div>
+      </div>
+    </div>
   </div>
+  <div class="section-divider"></div>
+  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Trailing Stop Loss (applies to both legs)</h2>
   <div class="form-row">
     <div><label>Trailing SL (pts)</label><input id="tcTrailSL" type="number" value="15"></div>
     <div><label>Activate Trail (pts)</label><input id="tcTrailAct" type="number" value="10"></div>
@@ -1034,8 +1102,8 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">TradingView Webhook Setup</h2>
   <p class="muted" style="margin-bottom:6px;">Webhook URL:</p>
   <div class="json-box" id="tcWebhookUrl" style="font-size:0.75rem;"></div>
-  <p class="muted" style="margin-bottom:6px;">Alert Message (just send BUY or SELL):</p>
-  <div class="json-box" style="font-size:0.75rem;">{"action":"BUY"}</div>
+  <p class="muted" style="margin-bottom:6px;">Alert Messages — send one of these from TradingView:</p>
+  <div class="json-box" style="font-size:0.75rem;">{"action":"buy_ce"} &nbsp; — buy CE (Call)<br>{"action":"buy_pe"} &nbsp; — buy PE (Put)<br>{"action":"sell_ce"} &nbsp; — sell/exit CE<br>{"action":"sell_pe"} &nbsp; — sell/exit PE<br>{"action":"BUY"} &nbsp;&nbsp;&nbsp; — uses default leg (CE)</div>
   <button class="btn btn-primary" onclick="copyTcWebhookUrl()">📋 Copy Webhook URL</button>
 </div>
 
@@ -1162,10 +1230,10 @@ async function requestToken(){document.getElementById('tokenBtn').disabled=true;
 async function toggleKillSwitch(){const isOn=document.getElementById('killToggle').checked;try{await api('/api/kill-switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:isOn?'on':'off'})});document.getElementById('killText').textContent=isOn?'ON':'OFF';document.getElementById('killBanner').classList.toggle('hidden',!isOn);toast(isOn?'⚠ Kill switch ON':'✅ Kill switch OFF');}catch(e){toast('❌ Error: '+e.message);}}
 async function loadInstruments(){try{const r=await api('/api/instruments');if(!r||r.error){console.error('loadInstruments error');return;}const s=document.getElementById('obInstrument');s.innerHTML='<option value="">— Select —</option>';r.instruments.forEach(i=>s.innerHTML+='<option value="'+i.key+'" data-lot="'+i.lot_size+'">'+i.name+' (lot: '+i.lot_size+')</option>');const tc=document.getElementById('tcUnderlying');if(tc){tc.innerHTML='';r.instruments.forEach(i=>tc.innerHTML+='<option value="'+i.key+'" data-lot="'+i.lot_size+'">'+i.name+' (lot: '+i.lot_size+')</option>');}}catch(e){console.error('loadInstruments error:',e);}}
 function onTcInstrumentChange(){const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value)return;const lot=parseInt(o.dataset.lot||'1',10);updateTcQty(lot);}
-function updateTcQty(lot){const lots=parseInt(document.getElementById('tcLots').value||'1',10);document.getElementById('tcQty').value=lots*lot;}
-async function loadTradingConfig(){try{const c=await api('/api/trading-config');if(!c||c.error){console.error('loadTradingConfig error');return;}const s=document.getElementById('tcUnderlying');if(s&&c.underlying){for(let i=0;i<s.options.length;i++){if(s.options[i].value===c.underlying){s.selectedIndex=i;break;}}onTcInstrumentChange();}document.getElementById('tcOptionType').value=c.option_type||'CE';document.getElementById('tcLots').value=c.lots||1;document.getElementById('tcProduct').value=c.product||'D';document.getElementById('tcExitTarget').value=c.exit_target_points||40;document.getElementById('tcExitSL').value=c.exit_sl_points||25;document.getElementById('tcTrailSL').value=c.trailing_sl_points||15;document.getElementById('tcTrailAct').value=c.trailing_activation_points||10;document.getElementById('tcUseExit').checked=c.use_exit!==false;const ws=getSetting_webhook_secret_hint();document.getElementById('tcWebhookUrl').textContent=window.location.origin+'/webhook?token=YOUR_WEBHOOK_SECRET';let p=[];p.push('Config loaded');document.getElementById('tcStatus').innerHTML=p.join(' &nbsp; ');updateTcQty(parseInt(s.options[s.selectedIndex]?.dataset.lot||'1',10));}catch(e){console.error('loadTradingConfig error:',e);}}
+function updateTcQty(lot){const ceLots=parseInt(document.getElementById('tcCeLots').value||'1',10);const peLots=parseInt(document.getElementById('tcPeLots').value||'1',10);document.getElementById('tcQty').value='CE:'+(ceLots*lot)+' PE:'+(peLots*lot);}
+async function loadTradingConfig(){try{const c=await api('/api/trading-config');if(!c||c.error){console.error('loadTradingConfig error');return;}const s=document.getElementById('tcUnderlying');if(s&&c.underlying){for(let i=0;i<s.options.length;i++){if(s.options[i].value===c.underlying){s.selectedIndex=i;break;}}onTcInstrumentChange();}document.getElementById('tcCeEnabled').checked=c.ce_enabled!==false;document.getElementById('tcCeLots').value=c.ce_lots||c.lots||1;document.getElementById('tcCeProduct').value=c.ce_product||c.product||'D';document.getElementById('tcCeExitTarget').value=c.ce_exit_target_points||c.exit_target_points||40;document.getElementById('tcCeExitSL').value=c.ce_exit_sl_points||c.exit_sl_points||25;document.getElementById('tcPeEnabled').checked=c.pe_enabled!==false;document.getElementById('tcPeLots').value=c.pe_lots||c.lots||1;document.getElementById('tcPeProduct').value=c.pe_product||c.product||'D';document.getElementById('tcPeExitTarget').value=c.pe_exit_target_points||c.exit_target_points||40;document.getElementById('tcPeExitSL').value=c.pe_exit_sl_points||c.exit_sl_points||25;document.getElementById('tcTrailSL').value=c.trailing_sl_points||15;document.getElementById('tcTrailAct').value=c.trailing_activation_points||10;document.getElementById('tcUseExit').checked=c.use_exit!==false;document.getElementById('tcWebhookUrl').textContent=window.location.origin+'/webhook?token=YOUR_WEBHOOK_SECRET';document.getElementById('tcStatus').innerHTML='Config loaded';updateTcQty(parseInt(s.options[s.selectedIndex]?.dataset.lot||'1',10));}catch(e){console.error('loadTradingConfig error:',e);}}
 function getSetting_webhook_secret_hint(){return '';}
-async function saveTradingConfig(){try{const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value){toast('Select underlying');return;}const lot=parseInt(o.dataset.lot||'1',10);const b={underlying:o.value,underlying_name:o.text.split(' (')[0],lot_size:lot,option_type:document.getElementById('tcOptionType').value,lots:parseInt(document.getElementById('tcLots').value||'1',10),product:document.getElementById('tcProduct').value,exit_target_points:parseFloat(document.getElementById('tcExitTarget').value||0),exit_sl_points:parseFloat(document.getElementById('tcExitSL').value||0),trailing_sl_points:parseFloat(document.getElementById('tcTrailSL').value||0),trailing_activation_points:parseFloat(document.getElementById('tcTrailAct').value||0),use_exit:document.getElementById('tcUseExit').checked};await api('/api/trading-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});toast('✅ Trading config saved!');}catch(e){toast('❌ Error: '+e.message);}}
+async function saveTradingConfig(){try{const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value){toast('Select underlying');return;}const lot=parseInt(o.dataset.lot||'1',10);const b={underlying:o.value,underlying_name:o.text.split(' (')[0],lot_size:lot,option_type:'CE',lots:parseInt(document.getElementById('tcCeLots').value||'1',10),product:document.getElementById('tcCeProduct').value,exit_target_points:parseFloat(document.getElementById('tcCeExitTarget').value||0),exit_sl_points:parseFloat(document.getElementById('tcCeExitSL').value||0),ce_enabled:document.getElementById('tcCeEnabled').checked,ce_lots:parseInt(document.getElementById('tcCeLots').value||'1',10),ce_product:document.getElementById('tcCeProduct').value,ce_exit_target_points:parseFloat(document.getElementById('tcCeExitTarget').value||0),ce_exit_sl_points:parseFloat(document.getElementById('tcCeExitSL').value||0),pe_enabled:document.getElementById('tcPeEnabled').checked,pe_lots:parseInt(document.getElementById('tcPeLots').value||'1',10),pe_product:document.getElementById('tcPeProduct').value,pe_exit_target_points:parseFloat(document.getElementById('tcPeExitTarget').value||0),pe_exit_sl_points:parseFloat(document.getElementById('tcPeExitSL').value||0),trailing_sl_points:parseFloat(document.getElementById('tcTrailSL').value||0),trailing_activation_points:parseFloat(document.getElementById('tcTrailAct').value||0),use_exit:document.getElementById('tcUseExit').checked};await api('/api/trading-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});toast('✅ Trading config saved!');}catch(e){toast('❌ Error: '+e.message);}}
 function copyTcWebhookUrl(){const u=document.getElementById('tcWebhookUrl').textContent;navigator.clipboard.writeText(u).then(()=>toast('✅ Webhook URL copied!'));}
 let _strategies = {};
 let _stratParams = {};

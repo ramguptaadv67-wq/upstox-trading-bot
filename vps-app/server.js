@@ -308,7 +308,21 @@ async function getLTP(accessToken, instrumentToken) {
   return key ? data.data[key].last_price : null;
 }
 
+// --- Option contracts cache (contracts don't change intraday) ---
+let _optionContractsCache = {}; // key: instrumentKey -> { data, timestamp }
+const OPTION_CACHE_TTL = 6 * 3600000; // 6 hours — contracts don't change intraday
+
 async function getOptionContracts(accessToken, instrumentKey, expiryDate) {
+  const cacheKey = instrumentKey;
+  const cached = _optionContractsCache[cacheKey];
+  if (cached && (Date.now() - cached.timestamp) < OPTION_CACHE_TTL) {
+    // Filter cached data by expiry if requested
+    let contracts = cached.data;
+    if (expiryDate) {
+      contracts = contracts.filter(c => c.expiry === expiryDate);
+    }
+    return { ok: true, status: 200, data: { data: cached.data } };
+  }
   let url = `https://api.upstox.com/v2/option/contract?instrument_key=${encodeURIComponent(instrumentKey)}`;
   if (expiryDate) url += `&expiry_date=${encodeURIComponent(expiryDate)}`;
   const resp = await fetchIPv4(url, { headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` } });
@@ -698,30 +712,36 @@ app.post("/webhook", async (req, res) => {
   logSignal(rawText.substring(0, 1000), payload, result.ok ? "order_placed" : "order_failed");
   logOrder("entry", action, instrumentToken, quantity, result.data, result.ok);
 
-  // Track position for exit engine
-  if (result.ok) {
-    const tcfg = getTradingConfig();
-    const config = getExitConfig();
-    const useExit = tcfg.use_exit || (config.enabled && config.mode !== "none");
-    const exitTargetPoints = payload.exit_target_points ?? tcfg.exit_target_points;
-    const exitSLPoints = payload.exit_sl_points ?? tcfg.exit_sl_points;
-    const trailSLPoints = payload.trailing_sl_points ?? tcfg.trailing_sl_points;
-    const trailActPoints = payload.trailing_activation_points ?? tcfg.trailing_activation_points;
+  // Respond to TradingView IMMEDIATELY — don't make TradingView wait for position tracking
+  res.json({ status: result.ok ? "order_placed" : "order_failed", action, instrument_token: instrumentToken, quantity, upstox: result.data });
 
-    if (useExit && (exitTargetPoints || exitSLPoints || trailSLPoints)) {
-      const ltp = entryPrice || await getLTP(token, instrumentToken);
-      const posExit = {};
-      if (exitTargetPoints) { posExit.mode = posExit.mode || "fixed_sl_target"; posExit.fixed_target_points = exitTargetPoints; }
-      if (exitSLPoints) { posExit.mode = posExit.mode || "fixed_sl_target"; posExit.fixed_sl_points = exitSLPoints; }
-      if (trailSLPoints) { posExit.mode = "trailing_sl"; posExit.trailing_sl_points = trailSLPoints; }
-      if (trailActPoints) { posExit.trailing_activation_points = trailActPoints; }
-      db.prepare(`INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`)
-        .run(instrumentToken, action, quantity, ltp || 0, ltp || 0, ltp || 0, Date.now(), JSON.stringify(posExit));
-      console.log(`[WEBHOOK] Position tracked for exit: ${JSON.stringify(posExit)}`);
+  // Track position for exit engine — runs AFTER response is sent (fire-and-forget)
+  if (result.ok) {
+    try {
+      const tcfg = getTradingConfig();
+      const config = getExitConfig();
+      const useExit = tcfg.use_exit || (config.enabled && config.mode !== "none");
+      const exitTargetPoints = payload.exit_target_points ?? tcfg.exit_target_points;
+      const exitSLPoints = payload.exit_sl_points ?? tcfg.exit_sl_points;
+      const trailSLPoints = payload.trailing_sl_points ?? tcfg.trailing_sl_points;
+      const trailActPoints = payload.trailing_activation_points ?? tcfg.trailing_activation_points;
+
+      if (useExit && (exitTargetPoints || exitSLPoints || trailSLPoints)) {
+        // Use entryPrice from ATM calculation — no extra getLTP() call needed
+        const ltp = entryPrice || 0;
+        const posExit = {};
+        if (exitTargetPoints) { posExit.mode = posExit.mode || "fixed_sl_target"; posExit.fixed_target_points = exitTargetPoints; }
+        if (exitSLPoints) { posExit.mode = posExit.mode || "fixed_sl_target"; posExit.fixed_sl_points = exitSLPoints; }
+        if (trailSLPoints) { posExit.mode = "trailing_sl"; posExit.trailing_sl_points = trailSLPoints; }
+        if (trailActPoints) { posExit.trailing_activation_points = trailActPoints; }
+        db.prepare(`INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`)
+          .run(instrumentToken, action, quantity, ltp, ltp, ltp, Date.now(), JSON.stringify(posExit));
+        console.log(`[WEBHOOK] Position tracked for exit: ${JSON.stringify(posExit)}`);
+      }
+    } catch (trackErr) {
+      console.error('[WEBHOOK] Position tracking error:', trackErr.message);
     }
   }
-
-  res.json({ status: result.ok ? "order_placed" : "order_failed", action, instrument_token: instrumentToken, quantity, upstox: result.data });
 });
 
 // Notifier — receives access token from Upstox after user approves

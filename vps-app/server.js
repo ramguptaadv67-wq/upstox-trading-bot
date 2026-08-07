@@ -391,7 +391,7 @@ async function getUpstoxPositions() {
 // --- Exit Engine (runs every 5 seconds) ---
 async function checkExits() {
   const config = getExitConfig();
-  if (!config.enabled || config.mode === "none") return;
+  const globalExitEnabled = config.enabled && config.mode !== "none";
   const { token, expiry } = await getToken();
   if (!token || Date.now() >= expiry) return;
   const positions = db.prepare("SELECT * FROM positions WHERE active = 1").all();
@@ -401,8 +401,15 @@ async function checkExits() {
     let shouldExit = false;
     let exitReason = "";
     const exitCfg = pos.exit_config ? JSON.parse(pos.exit_config) : {};
-    // BUG 8: Skip strategy-managed positions — TRONE handles its own exits
+    // Skip strategy-managed positions — strategy engine handles its own exits
     if (exitCfg.strategy_managed) continue;
+
+    // Each position can have its OWN exit config (from webhook CE/PE legs)
+    // If position has its own mode, use it. Otherwise fall back to global config.
+    // If neither has exit config, skip this position.
+    const hasOwnExit = exitCfg.mode && exitCfg.mode !== "none";
+    if (!hasOwnExit && !globalExitEnabled) continue; // No exit config for this position
+
     const mode = exitCfg.mode || config.mode;
     const trailSLpts = exitCfg.trailing_sl_points ?? config.trailing_sl_points;
     const trailActPts = exitCfg.trailing_activation_points ?? config.trailing_activation_points;
@@ -784,10 +791,15 @@ app.post("/webhook", async (req, res) => {
         // Use entryPrice from ATM calculation — no extra getLTP() call needed
         const ltp = entryPrice || 0;
         const posExit = {};
-        if (exitTargetPoints) { posExit.mode = posExit.mode || "fixed_sl_target"; posExit.fixed_target_points = exitTargetPoints; }
-        if (exitSLPoints) { posExit.mode = posExit.mode || "fixed_sl_target"; posExit.fixed_sl_points = exitSLPoints; }
-        if (trailSLPoints) { posExit.mode = "trailing_sl"; posExit.trailing_sl_points = trailSLPoints; }
-        if (trailActPoints) { posExit.trailing_activation_points = trailActPoints; }
+        let hasFixed = false, hasTrailing = false;
+        if (exitTargetPoints) { posExit.fixed_target_points = exitTargetPoints; hasFixed = true; }
+        if (exitSLPoints) { posExit.fixed_sl_points = exitSLPoints; hasFixed = true; }
+        if (trailSLPoints) { posExit.trailing_sl_points = trailSLPoints; hasTrailing = true; }
+        if (trailActPoints) { posExit.trailing_activation_points = trailActPoints; hasTrailing = true; }
+        // Set mode: "both" if both, "trailing_sl" if only trailing, "fixed_sl_target" if only fixed
+        if (hasFixed && hasTrailing) posExit.mode = "both";
+        else if (hasTrailing) posExit.mode = "trailing_sl";
+        else if (hasFixed) posExit.mode = "fixed_sl_target";
         db.prepare(`INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`)
           .run(instrumentToken, action, quantity, ltp, ltp, ltp, Date.now(), JSON.stringify(posExit));
         console.log(`[WEBHOOK] Position tracked for exit: ${JSON.stringify(posExit)}`);

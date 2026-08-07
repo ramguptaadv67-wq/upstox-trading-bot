@@ -328,6 +328,11 @@ async function getOptionContracts(accessToken, instrumentKey, expiryDate) {
   const resp = await fetchIPv4(url, { headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` } });
   const text = await resp.text();
   let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  // Cache the contracts array for 6 hours (contracts don't change intraday)
+  if (resp.ok && data && data.data && Array.isArray(data.data)) {
+    _optionContractsCache[cacheKey] = { data: data.data, timestamp: Date.now() };
+    console.log(`[CACHE] Stored ${data.data.length} option contracts for ${instrumentKey}`);
+  }
   return { ok: resp.ok, status: resp.status, data };
 }
 
@@ -358,6 +363,11 @@ async function getUpstoxPositions() {
   });
   const text = await resp.text();
   let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  // Cache the contracts array for 6 hours (contracts don't change intraday)
+  if (resp.ok && data && data.data && Array.isArray(data.data)) {
+    _optionContractsCache[cacheKey] = { data: data.data, timestamp: Date.now() };
+    console.log(`[CACHE] Stored ${data.data.length} option contracts for ${instrumentKey}`);
+  }
   return { ok: resp.ok, status: resp.status, data };
 }
 
@@ -681,8 +691,8 @@ app.post("/webhook", async (req, res) => {
       // Plain SELL — match any active BUY position
       matchingPosition = activePositions.find(p => p.transaction_type === "BUY");
     }
+    const legLabel = legOptionType ? ` ${legOptionType}` : "";
     if (!matchingPosition) {
-      const legLabel = legOptionType ? ` ${legOptionType}` : "";
       console.log(`[WEBHOOK] SELL${legLabel} rejected — no open BUY position to exit`);
       logSignal(rawText.substring(0, 1000), payload, "sell_rejected_no_position");
       return res.json({
@@ -838,25 +848,30 @@ app.get("/api/upstox-positions", async (req, res) => {
 
 // --- Manual exit position — places a SELL order and marks position closed ---
 app.post("/api/exit-position", async (req, res) => {
-  const posId = req.body.id;
-  if (!posId) return res.json({ ok: false, error: "missing position id" });
-  const pos = db.prepare("SELECT * FROM positions WHERE id = ? AND active = 1").get(posId);
-  if (!pos) return res.json({ ok: false, error: "position not found or already closed" });
-  const { token, expiry } = await getToken();
-  if (!token || Date.now() >= expiry) return res.json({ ok: false, error: "no Upstox access token" });
-  const exitAction = pos.transaction_type === "BUY" ? "SELL" : "BUY";
-  const result = await placeUpstoxOrder(token, {
-    quantity: pos.quantity, product: "D", validity: "DAY",
-    order_type: "MARKET", transaction_type: exitAction, instrument_token: pos.instrument_token,
-  });
-  if (result.ok) {
-    db.prepare("UPDATE positions SET active = 0 WHERE id = ?").run(posId);
-    logOrder("exit", exitAction, pos.instrument_token, pos.quantity, result.data, true);
-    addLog("INFO", `Manual exit: ${pos.instrument_token} qty ${pos.quantity} (${exitAction})`);
-    res.json({ ok: true, message: "Exit order placed" });
-  } else {
-    logOrder("exit", exitAction, pos.instrument_token, pos.quantity, result.data, false);
-    res.json({ ok: false, error: JSON.stringify(result.data || result) });
+  try {
+    const posId = req.body.id;
+    if (!posId) return res.json({ ok: false, error: "missing position id" });
+    const pos = db.prepare("SELECT * FROM positions WHERE id = ? AND active = 1").get(posId);
+    if (!pos) return res.json({ ok: false, error: "position not found or already closed" });
+    const { token, expiry } = await getToken();
+    if (!token || Date.now() >= expiry) return res.json({ ok: false, error: "no Upstox access token" });
+    const exitAction = pos.transaction_type === "BUY" ? "SELL" : "BUY";
+    const result = await placeUpstoxOrder(token, {
+      quantity: pos.quantity, product: "D", validity: "DAY",
+      order_type: "MARKET", transaction_type: exitAction, instrument_token: pos.instrument_token,
+    });
+    if (result.ok) {
+      db.prepare("UPDATE positions SET active = 0 WHERE id = ?").run(posId);
+      logOrder("exit", exitAction, pos.instrument_token, pos.quantity, result.data, true);
+      addLog("INFO", `Manual exit: ${pos.instrument_token} qty ${pos.quantity} (${exitAction})`);
+      res.json({ ok: true, message: "Exit order placed" });
+    } else {
+      logOrder("exit", exitAction, pos.instrument_token, pos.quantity, result.data, false);
+      res.json({ ok: false, error: JSON.stringify(result.data || result) });
+    }
+  } catch (err) {
+    console.error("[EXIT] Error:", err.message);
+    res.json({ ok: false, error: err.message });
   }
 });
 

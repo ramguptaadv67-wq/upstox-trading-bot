@@ -642,6 +642,38 @@ app.post("/webhook", async (req, res) => {
     console.log(`[WEBHOOK] ATM: ${atm.atm_strike} ${legOptionType} (spot ${atm.spot}), token ${instrumentToken}, qty ${quantity}`);
   }
 
+  // SAFETY GUARD: If action is SELL, check if there's an active BUY position to exit.
+  // Reject naked short sells — prevents accidental sell orders without a prior buy.
+  if (action === "SELL") {
+    const activePositions = db.prepare("SELECT * FROM positions WHERE active = 1").all();
+    let matchingPosition = null;
+    if (legOptionType) {
+      // sell_ce or sell_pe — match by option type (CE/PE) in instrument_token
+      matchingPosition = activePositions.find(p =>
+        p.transaction_type === "BUY" &&
+        p.instrument_token && p.instrument_token.includes(legOptionType)
+      );
+    } else {
+      // Plain SELL — match any active BUY position
+      matchingPosition = activePositions.find(p => p.transaction_type === "BUY");
+    }
+    if (!matchingPosition) {
+      const legLabel = legOptionType ? ` ${legOptionType}` : "";
+      console.log(`[WEBHOOK] SELL${legLabel} rejected — no open BUY position to exit`);
+      logSignal(rawText.substring(0, 1000), payload, "sell_rejected_no_position");
+      return res.json({
+        status: "rejected",
+        reason: `No open ${legLabel.trim()} position to exit. Sell ignored — place a buy first.`
+      });
+    }
+    // Use the matching position's instrument and quantity for the exit
+    if (!payloadInstrument) {
+      instrumentToken = matchingPosition.instrument_token;
+      quantity = matchingPosition.quantity;
+    }
+    console.log(`[WEBHOOK] SELL${legLabel} approved — exiting position ${matchingPosition.instrument_token} qty ${matchingPosition.quantity}`);
+  }
+
   let result;
   try {
     result = await placeUpstoxOrder(token, {

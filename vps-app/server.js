@@ -790,7 +790,7 @@ app.post("/webhook", async (req, res) => {
   let result;
   try {
     result = await placeUpstoxOrder(token, {
-      quantity, product: payload.product, validity: payload.validity, price: payload.price,
+      quantity, product: (matchingPosition ? (matchingPosition.product || 'D') : (payload.product || 'D')), validity: payload.validity, price: payload.price,
       order_type: payload.order_type || "MARKET", transaction_type: action, instrument_token: instrumentToken,
     });
   } catch (err) {
@@ -799,13 +799,19 @@ app.post("/webhook", async (req, res) => {
   }
 
   logSignal(rawText.substring(0, 1000), payload, result.ok ? "order_placed" : "order_failed");
-  logOrder("entry", action, instrumentToken, quantity, result.data, result.ok);
+  logOrder(action === "SELL" ? "exit" : "entry", action, instrumentToken, quantity, result.data, result.ok);
 
   // Respond to TradingView IMMEDIATELY — don't make TradingView wait for position tracking
   res.json({ status: result.ok ? "order_placed" : "order_failed", action, instrument_token: instrumentToken, quantity, upstox: result.data });
 
-  // Track position for exit engine — runs AFTER response is sent (fire-and-forget)
-  if (result.ok) {
+  // After SELL: mark position inactive and skip position tracking
+  if (result.ok && action === "SELL" && matchingPosition) {
+    db.prepare("UPDATE positions SET active = 0 WHERE id = ?").run(matchingPosition.id);
+    console.log(`[WEBHOOK] Position ${matchingPosition.id} marked inactive after SELL`);
+    addLog("INFO", `SELL webhook: Position ${matchingPosition.instrument_token} qty ${matchingPosition.quantity} closed`);
+  }
+  // Track position for exit engine — only for BUY orders (runs AFTER response)
+  if (result.ok && action !== "SELL") {
     try {
       const tcfg = getTradingConfig();
       const config = getExitConfig();

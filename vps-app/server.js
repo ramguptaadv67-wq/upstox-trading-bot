@@ -79,9 +79,10 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
   CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, raw_message TEXT, payload TEXT, status TEXT);
   CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, type TEXT, action TEXT, instrument_token TEXT, quantity INTEGER, result TEXT, ok INTEGER);
-  CREATE TABLE IF NOT EXISTS positions (id INTEGER PRIMARY KEY AUTOINCREMENT, instrument_token TEXT, transaction_type TEXT, quantity INTEGER, entry_price REAL, highest_price REAL, lowest_price REAL, added_at INTEGER, exit_config TEXT, active INTEGER DEFAULT 1);
+  CREATE TABLE IF NOT EXISTS positions (id INTEGER PRIMARY KEY AUTOINCREMENT, instrument_token TEXT, transaction_type TEXT, quantity INTEGER, entry_price REAL, highest_price REAL, lowest_price REAL, added_at INTEGER, exit_config TEXT, product TEXT DEFAULT 'D', active INTEGER DEFAULT 1);
   CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, level TEXT, message TEXT);
 `);
+try { db.exec("ALTER TABLE positions ADD COLUMN product TEXT DEFAULT 'D'"); } catch(e) {}
 
 // --- Helpers ---
 function getSetting(key, fallback = "") {
@@ -308,9 +309,9 @@ async function placeUpstoxOrder(accessToken, order) {
   return { ok: orderAccepted, status: resp.status, data };
 }
 
-async function placeExitOrder(accessToken, instrumentToken, quantity, transactionType) {
+async function placeExitOrder(accessToken, instrumentToken, quantity, transactionType, product) {
   return await placeUpstoxOrder(accessToken, {
-    quantity, product: "I", order_type: "MARKET",
+    quantity, product: product || "D", validity: "DAY", order_type: "MARKET",
     transaction_type: transactionType, instrument_token: instrumentToken,
     tag: "exit",
   });
@@ -465,7 +466,7 @@ async function checkExits() {
 
     if (shouldExit) {
       const exitSide = isBuy ? "SELL" : "BUY";
-      const result = await placeExitOrder(token, pos.instrument_token, pos.quantity, exitSide);
+      const result = await placeExitOrder(token, pos.instrument_token, pos.quantity, exitSide, pos.product || 'D');
       logOrder("exit", exitSide, pos.instrument_token, pos.quantity, result.data, result.ok);
       addLog("INFO", `Exit: ${exitReason} — ${pos.instrument_token}`);
       db.prepare("UPDATE positions SET active = 0 WHERE id = ?").run(pos.id);
@@ -800,8 +801,8 @@ app.post("/webhook", async (req, res) => {
         if (hasFixed && hasTrailing) posExit.mode = "both";
         else if (hasTrailing) posExit.mode = "trailing_sl";
         else if (hasFixed) posExit.mode = "fixed_sl_target";
-        db.prepare(`INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`)
-          .run(instrumentToken, action, quantity, ltp, ltp, ltp, Date.now(), JSON.stringify(posExit));
+        db.prepare(`INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`)
+          .run(instrumentToken, action, quantity, ltp, ltp, ltp, Date.now(), JSON.stringify(posExit), legProduct || 'D');
         console.log(`[WEBHOOK] Position tracked for exit: ${JSON.stringify(posExit)}`);
       }
     } catch (trackErr) {
@@ -913,7 +914,7 @@ app.post("/api/exit-position", async (req, res) => {
     if (!token || Date.now() >= expiry) return res.json({ ok: false, error: "no Upstox access token" });
     const exitAction = pos.transaction_type === "BUY" ? "SELL" : "BUY";
     const result = await placeUpstoxOrder(token, {
-      quantity: pos.quantity, product: "D", validity: "DAY",
+      quantity: pos.quantity, product: pos.product || "D", validity: "DAY",
       order_type: "MARKET", transaction_type: exitAction, instrument_token: pos.instrument_token,
     });
     if (result.ok) {
@@ -954,7 +955,7 @@ app.post("/api/manual-order", async (req, res) => {
       const posExit = {};
       if (body.exit_target_points) { posExit.mode = "fixed_sl_target"; posExit.fixed_target_points = body.exit_target_points; }
       if (body.exit_sl_points) { posExit.fixed_sl_points = body.exit_sl_points; }
-      db.prepare(`INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`)
+      db.prepare(`INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`)
         .run(body.instrument_token, body.action, body.quantity, entryPrice || 0, entryPrice || 0, entryPrice || 0, Date.now(), JSON.stringify(posExit));
     }
   }

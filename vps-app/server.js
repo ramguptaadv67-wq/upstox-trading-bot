@@ -788,23 +788,22 @@ app.post("/webhook", async (req, res) => {
       const trailSLPoints = payload.trailing_sl_points ?? tcfg.trailing_sl_points;
       const trailActPoints = payload.trailing_activation_points ?? tcfg.trailing_activation_points;
 
-      if (useExit && (exitTargetPoints || exitSLPoints || trailSLPoints)) {
-        // Use entryPrice from ATM calculation — no extra getLTP() call needed
-        const ltp = entryPrice || 0;
-        const posExit = {};
+      // ALWAYS track position — even if exit tracking is disabled
+      const ltp = entryPrice || 0;
+      const posExit = {};
+      if (useExit) {
         let hasFixed = false, hasTrailing = false;
         if (exitTargetPoints) { posExit.fixed_target_points = exitTargetPoints; hasFixed = true; }
         if (exitSLPoints) { posExit.fixed_sl_points = exitSLPoints; hasFixed = true; }
         if (trailSLPoints) { posExit.trailing_sl_points = trailSLPoints; hasTrailing = true; }
         if (trailActPoints) { posExit.trailing_activation_points = trailActPoints; hasTrailing = true; }
-        // Set mode: "both" if both, "trailing_sl" if only trailing, "fixed_sl_target" if only fixed
         if (hasFixed && hasTrailing) posExit.mode = "both";
         else if (hasTrailing) posExit.mode = "trailing_sl";
         else if (hasFixed) posExit.mode = "fixed_sl_target";
-        db.prepare(`INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`)
-          .run(instrumentToken, action, quantity, ltp, ltp, ltp, Date.now(), JSON.stringify(posExit), legProduct || 'D');
-        console.log(`[WEBHOOK] Position tracked for exit: ${JSON.stringify(posExit)}`);
       }
+      db.prepare(`INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`)
+        .run(instrumentToken, action, quantity, ltp, ltp, ltp, Date.now(), JSON.stringify(posExit), legProduct || 'D');
+      console.log(`[WEBHOOK] Position tracked: ${instrumentToken} qty=${quantity} product=${legProduct || 'D'} exit=${JSON.stringify(posExit)}`);
     } catch (trackErr) {
       console.error('[WEBHOOK] Position tracking error:', trackErr.message);
     }

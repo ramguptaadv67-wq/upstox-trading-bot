@@ -317,6 +317,32 @@ async function placeExitOrder(accessToken, instrumentToken, quantity, transactio
   });
 }
 
+// Fetch actual fill price from Upstox after order completes
+async function getOrderFillPrice(accessToken, orderId) {
+  try {
+    // Wait 1.5s for exchange to process the order
+    await new Promise(r => setTimeout(r, 1500));
+    const url = `https://api-hft.upstox.com/v3/order/details?order_id=${encodeURIComponent(orderId)}`;
+    const resp = await fetchIPv4(url, {
+      headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` }
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    // V3 order details returns data with average_price and status
+    if (data && data.data) {
+      const d = Array.isArray(data.data) ? data.data[data.data.length - 1] : data.data;
+      if (d && d.average_price && d.average_price > 0 && d.status === "complete") {
+        console.log(`[ORDER] Fill price fetched: ${d.average_price} (order ${orderId})`);
+        return d.average_price;
+      }
+    }
+    return null;
+  } catch (e) {
+    console.error("[ORDER] Error fetching fill price:", e.message);
+    return null;
+  }
+}
+
 async function getLTP(accessToken, instrumentToken) {
   const url = `https://api.upstox.com/v2/market-quote/ltp?instrument_key=${encodeURIComponent(instrumentToken)}`;
   const resp = await fetchIPv4(url, { headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` } });
@@ -790,7 +816,13 @@ app.post("/webhook", async (req, res) => {
       const trailActPoints = payload.trailing_activation_points ?? tcfg.trailing_activation_points;
 
       // ALWAYS track position — even if exit tracking is disabled
-      const ltp = entryPrice || 0;
+      // Fetch actual fill price from Upstox (not estimated LTP)
+      const orderId = result.data?.data?.order_ids?.[0];
+      let actualFillPrice = null;
+      if (orderId) {
+        actualFillPrice = await getOrderFillPrice(token, orderId);
+      }
+      const ltp = actualFillPrice || entryPrice || 0;
       const posExit = {};
       if (useExit) {
         let hasFixed = false, hasTrailing = false;

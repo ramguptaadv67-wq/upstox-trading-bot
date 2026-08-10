@@ -685,6 +685,7 @@ app.post("/webhook", async (req, res) => {
   const payloadInstrument = payload.instrument_token || payload.ticker || payload.symbol || payload.instrument_key || "";
 
   let instrumentToken, quantity, entryPrice;
+  let legProduct = 'D';
   let legOptionType = forcedOptionType;
 
   if (payloadInstrument) {
@@ -699,7 +700,7 @@ app.post("/webhook", async (req, res) => {
     if (!legOptionType) legOptionType = tcfg.option_type || "CE";
 
     // Pick leg-specific config
-    let legLots, legProduct, legExitTarget, legExitSL;
+    let legLots, legExitTarget, legExitSL;
     if (legOptionType === "CE") {
       legLots = tcfg.ce_lots ?? tcfg.lots ?? 1;
       legProduct = tcfg.ce_product ?? tcfg.product ?? "D";

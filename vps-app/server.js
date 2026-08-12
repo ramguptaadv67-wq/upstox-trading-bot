@@ -1199,53 +1199,14 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   </div>
 </div>
 <div class="tab-row">
-  <div class="tab active" onclick="showTab('builder',this)">📋 Order Builder</div>
-  <div class="tab" onclick="showTab('auto',this)">🤖 Auto Trade Config</div>
-  <div class="tab" onclick="showTab('strategy',this)">📈 Strategy Engine</div>
-  <div class="tab" onclick="showTab('backtest',this)">🧪 Backtest</div>
-  <div class="tab" onclick="showTab('signals',this)">Signals</div>
+    <div class="tab active" onclick="showTab('auto',this)">🤖 Auto Trade Config</div>
+      <div class="tab" onclick="showTab('signals',this)">Signals</div>
   <div class="tab" onclick="showTab('orders',this)">Orders</div>
   <div class="tab" onclick="showTab('positions',this)">Positions</div>
-  <div class="tab" onclick="showTab('exit',this)">Exit Conditions</div>
-  <div class="tab" onclick="showTab('settings',this)">⚙️ Settings</div>
+    <div class="tab" onclick="showTab('settings',this)">⚙️ Settings</div>
 </div>
 
-<div id="tab-builder" class="card">
-  <h2>Order Builder — ATM Auto-Select</h2>
-  <p class="muted" style="margin-bottom:12px;">Select instrument & expiry. Auto-selects ATM strike.</p>
-  <div class="form-row">
-    <div style="flex:2"><label>1. Underlying</label><select id="obInstrument" onchange="onInstrumentChange()"><option value="">— Select —</option></select></div>
-    <div><label>2. Action</label><select id="obAction"><option value="BUY">BUY</option><option value="SELL">SELL</option></select></div>
-  </div>
-  <div class="form-row">
-    <div><label>3. Expiry</label><select id="obExpiry" onchange="onExpiryChange()" disabled><option value="">Select instrument first</option></select></div>
-    <div><label>4. Type</label><select id="obOptionType" onchange="onExpiryChange()"><option value="CE">CE (Call)</option><option value="PE">PE (Put)</option></select></div>
-    <div><label>5. Lots</label><input id="obLots" type="number" value="1" min="1" onchange="updateJSON()"></div>
-    <div><label>Qty</label><input id="obQty" type="number" readonly style="opacity:.6"></div>
-  </div>
-  <div id="atmInfo" class="hidden" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:10px;">
-    <div class="status-row"><span class="dot green"></span> <b>ATM:</b> <span id="atmStrike">—</span> &nbsp; <b>Spot:</b> <span id="atmSpot">—</span> &nbsp; <b>LTP:</b> ₹<span id="atmLtp">—</span></div>
-  </div>
-  <div class="section-divider"></div>
-  <div class="form-row">
-    <div><label>6. Order Type</label><select id="obOrderType" onchange="updateJSON()"><option>MARKET</option><option>LIMIT</option></select></div>
-    <div><label>7. Product</label><select id="obProduct" onchange="updateJSON()"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
-  </div>
-  <div class="form-row">
-    <div><label>8. Exit Target (pts)</label><input id="obExitTarget" type="number" placeholder="40" onchange="updateJSON()"></div>
-    <div><label>9. Exit SL (pts)</label><input id="obExitSL" type="number" placeholder="25" onchange="updateJSON()"></div>
-    <div><label>10. Trailing SL (pts)</label><input id="obTrailSL" type="number" placeholder="15" onchange="updateJSON()"></div>
-    <div><label>11. Activate Trail (pts)</label><input id="obTrailAct" type="number" placeholder="10" onchange="updateJSON()"></div>
-  </div>
-  <div class="section-divider"></div>
-  <h2 style="margin-bottom:6px;">Generated JSON</h2>
-  <div class="json-box" id="jsonOutput">Fill in fields above...</div>
-  <div class="form-row" style="margin-top:10px;">
-    <button class="btn btn-success" onclick="copyJSON()">📋 Copy JSON</button>
-    <button class="btn btn-primary" onclick="copyWebhookUrl()">📋 Copy Webhook URL</button>
-    <button class="btn btn-secondary" onclick="placeBuilderOrder()">⚡ Place Order Now</button>
-  </div>
-</div>
+
 
 <div id="tab-signals" class="card hidden">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;"><h2>Signals — Raw Messages</h2><button class="btn btn-secondary" onclick="loadSignals()">Refresh</button></div>
@@ -1326,94 +1287,10 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   <button class="btn btn-primary" onclick="copyTcWebhookUrl()">📋 Copy Webhook URL</button>
 </div>
 
-<div id="tab-strategy" class="card hidden">
-  <h2>📈 Strategy Engine</h2>
-  <p class="muted" style="margin-bottom:12px;">Pick a strategy, adjust parameters, enable. Only one strategy runs at a time. Strategy code is saved internally — not shown.</p>
-  <div id="stratStatus" class="muted" style="margin-bottom:10px;"></div>
-  <div id="stratLastSignal" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:12px;display:none;">
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-      <span id="stratSignalDot" class="dot" style="width:10px;height:10px;border-radius:50%;background:var(--blue);"></span>
-      <b style="font-size:1rem;">Last Signal: <span id="stratSignalText" style="color:var(--blue);">—</span></b>
-      <span class="muted" style="margin-left:auto;" id="stratSignalTime">—</span>
-    </div>
-    <div id="stratSignalDetails" class="muted" style="font-size:0.8rem;"></div>
-  </div>
-  <div id="stratSignalHistory" style="margin-bottom:12px;display:none;">
-    <div class="muted" style="font-size:0.8rem;margin-bottom:4px;">Recent Signals:</div>
-    <div id="stratSignalList" style="max-height:120px;overflow-y:auto;"></div>
-  </div>
-  <div class="section-divider"></div>
-  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Live Signal Log — Open/Close (auto-refresh 5s)</h2>
-  <div id="stratLiveLog" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;max-height:300px;overflow-y:auto;font-family:monospace;font-size:0.75rem;">
-    <div class="muted" style="text-align:center;padding:20px;">No signals yet. Enable strategy engine to see live OPEN/CLOSE signals.</div>
-  </div>
-  <div class="form-row" style="align-items:center;margin-top:8px;">
-    <button class="btn btn-secondary" onclick="clearStratLog()">Clear Log</button>
-    <span class="muted" style="font-size:0.75rem;margin-left:8px;" id="stratLogCount">0 signals</span>
-  </div>
-  <div class="form-row" style="align-items:center;">
-    <label class="toggle"><input type="checkbox" id="stratEnabled" onchange="toggleStratEngine()"><span class="slider"></span></label>
-    <span style="margin-left:8px;font-weight:600;">Enable Strategy Engine</span>
-    <button class="btn btn-secondary" onclick="loadStratConfig()" style="margin-left:auto;">Refresh</button>
-    <button class="btn btn-primary" onclick="saveStratConfig()">💾 Save Config</button>
-    <button class="btn btn-primary" onclick="previewStrat()">▶ Preview</button>
-    <button class="btn btn-secondary" onclick="resetStratState()">Reset State</button>
-  </div>
-  <div class="section-divider"></div>
-  <div class="form-row">
-    <div style="flex:2"><label>Strategy</label><select id="stratSelect" onchange="onStratChange()"></select></div>
-    <div style="flex:2"><label>Underlying</label><select id="stratUnderlying"></select></div>
-    <div><label>Entry TF</label><select id="stratCandleInterval"><option value="1m">1 min</option><option value="3m" selected>3 min</option><option value="5m">5 min</option><option value="15m">15 min</option></select></div>
-    <div><label>HTF</label><select id="stratHtfInterval"><option value="3m">3 min</option><option value="15m">15 min</option><option value="30m">30 min</option><option value="45m" selected>45 min</option></select></div>
-  </div>
-  <div class="form-row">
-    <div><label>Lots</label><input id="stratLots" type="number" value="1" min="1"></div>
-    <div><label>Product</label><select id="stratProduct"><option value="I">I (Intraday)</option><option value="D">D (Delivery)</option></select></div>
-    <div><label>Cooldown (sec)</label><input id="stratCooldown" type="number" value="60"></div>
-  </div>
-  <div class="section-divider"></div>
-  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Strategy Parameters</h2>
-  <div id="stratParams" class="form-row" style="flex-wrap:wrap;gap:8px;"></div>
-  <div id="stratPreview" class="json-box hidden" style="margin-top:10px;"></div>
-  <div class="muted" style="font-size:0.8rem;margin-top:8px;">⚡ WebSocket real-time mode. Strategy code saved on server. Parameters editable here.</div>
-</div>
-<div id="tab-backtest" class="card hidden">
-  <h2>🧪 Strategy Backtest</h2>
-  <p class="muted" style="margin-bottom:12px;">Runs the selected strategy over historical candles and shows entry, exit, and P&L in points.</p>
-  <div class="form-row" style="align-items:center;">
-    <div style="flex:2"><label>Strategy (uses saved config)</label><select id="btStrategy" disabled></select></div>
-    <div><label>Interval</label><select id="btInterval"><option value="1m">1 min</option><option value="3m">3 min</option><option value="5m" selected>5 min</option><option value="15m">15 min</option><option value="30m">30 min</option></select></div>
-    <button class="btn btn-primary" onclick="runBacktest()" style="margin-top:18px;">▶ Run Backtest</button>
-  </div>
-  <div id="btStatus" class="muted" style="margin-top:10px;"></div>
-  <div id="btSummary" style="display:none;margin-top:12px;"></div>
-  <div id="btResults" style="margin-top:12px;max-height:400px;overflow-y:auto;"></div>
-</div>
 
-<div id="tab-exit" class="card hidden">
-  <h2>Exit Conditions</h2>
-  <p class="muted" style="margin-bottom:12px;">Configure automatic exit rules for webhook-placed orders.</p>
-  <div class="form-row" style="align-items:center;">
-    <label class="toggle"><input type="checkbox" id="exitEnabled"><span class="slider"></span></label>
-    <span style="margin-left:8px;font-weight:600;">Enable Exit Engine</span>
-  </div>
-  <div class="section-divider"></div>
-  <div class="form-row">
-    <div><label>Mode</label><select id="exitMode"><option value="none">None</option><option value="fixed_sl_target">Fixed SL + Target</option><option value="trailing_sl">Trailing SL</option><option value="both">Both</option></select></div>
-  </div>
-  <div class="form-row">
-    <div><label>Trailing SL (pts)</label><input id="trailSL" type="number" value="20"></div>
-    <div><label>Activate Trail After (pts)</label><input id="trailAct" type="number" value="10"></div>
-  </div>
-  <div class="form-row">
-    <div><label>Fixed SL (pts)</label><input id="fixedSL" type="number" value="30"></div>
-    <div><label>Fixed Target (pts)</label><input id="fixedTarget" type="number" value="40"></div>
-  </div>
-  <div class="form-row" style="margin-top:10px;">
-    <button class="btn btn-success" onclick="saveExitConfig()">Save</button>
-    <button class="btn btn-secondary" onclick="loadExitConfig()">Refresh</button>
-  </div>
-</div>
+
+
+
 
 <div id="tab-settings" class="card hidden">
   <h2>⚙️ Settings</h2>
@@ -1445,7 +1322,7 @@ document.addEventListener('DOMContentLoaded',function(){document.title=document.
 const api=async(p,o)=>{try{const r=await fetch(p,o);if(!r.ok){console.error('API error:',r.status,p);return{error:'HTTP '+r.status};}return await r.json();}catch(e){console.error('API fetch error:',e.message,p);return{error:e.message};}};
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',3500);}
 function fmtTime(ts){return ts?new Date(ts).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:false}):'—';}
-let _activeTab='';function showTab(n,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');document.querySelectorAll('[id^="tab-"]').forEach(d=>d.classList.add('hidden'));document.getElementById('tab-'+n).classList.remove('hidden');_activeTab=n;if(n==='signals')loadSignals();if(n==='orders')loadOrders();if(n==='positions')loadPositions();if(n==='exit')loadExitConfig();if(n==='settings')loadSettings();if(n==='auto')loadTradingConfig();if(n==='strategy')loadStratConfig();if(n==='backtest')loadBacktestStrats();}
+let _activeTab='';function showTab(n,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');document.querySelectorAll('[id^="tab-"]').forEach(d=>d.classList.add('hidden'));document.getElementById('tab-'+n).classList.remove('hidden');_activeTab=n;if(n==='signals')loadSignals();if(n==='orders')loadOrders();if(n==='positions')loadPositions();if(n==='settings')loadSettings();if(n==='auto')loadTradingConfig();}
 let obState={instrumentKey:null,lotSize:1,instrumentToken:null};
 async function loadStatus(){try{const s=await api('/api/token-status');if(!s||s.error){document.getElementById('tokenText').textContent='Error';return;}const d=document.getElementById('tokenDot'),t=document.getElementById('tokenText');if(!s.has_token){d.className='dot red';t.textContent='No token';}else if(s.is_expired){d.className='dot red';t.textContent='EXPIRED';}else{d.className='dot green';t.textContent='Valid until '+fmtTime(s.expires_at);}document.getElementById('killToggle').checked=s.kill_switch;document.getElementById('killText').textContent=s.kill_switch?'OFF':'ON';document.getElementById('killBanner').classList.toggle('hidden',!s.kill_switch);api('/health').then(h=>{if(h&&!h.error)document.getElementById('marketStatus').textContent=h.market_open?'OPEN':'CLOSED';});}catch(e){console.error('loadStatus error:',e);}}
 async function requestToken(){document.getElementById('tokenBtn').disabled=true;try{const r=await api('/api/request-token',{method:'POST'});if(r.ok){toast('✅ Token request sent — approve on Upstox app');}else{const msg=(r.data&&(r.data.message||r.data.error||JSON.stringify(r.data)))||'HTTP '+r.status;toast('❌ Failed: '+msg);}}catch(e){toast('❌ Network error: '+e.message);}document.getElementById('tokenBtn').disabled=false;setTimeout(loadStatus,3000);}

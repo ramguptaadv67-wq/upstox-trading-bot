@@ -789,11 +789,17 @@ app.post("/webhook", async (req, res) => {
 
   let result;
   try {
-    // Always use LIMIT order with LTP as price — avoids circuit limit margin issue
-    const orderLTP = entryPrice || 0;
+    // Fetch OPTION's actual LTP for LIMIT order — avoids circuit limit margin issue
+    let optionLTP = entryPrice || 0;
+    // In Mode 2, entryPrice is atm.spot (NIFTY index), NOT option premium
+    // Must fetch the actual option premium using the instrument token
+    if (!payloadInstrument) {
+      optionLTP = await getLTP(token, instrumentToken);
+      console.log(`[WEBHOOK] Option LTP fetched: ${optionLTP} for ${instrumentToken}`);
+    }
     result = await placeUpstoxOrder(token, {
       quantity, product: (matchingPosition ? (matchingPosition.product || 'D') : (payload.product || legProduct || 'D')), validity: "DAY",
-      price: orderLTP || 0,
+      price: optionLTP || 0,
       order_type: "LIMIT", transaction_type: action, instrument_token: instrumentToken,
     });
   } catch (err) {

@@ -880,8 +880,14 @@ app.post("/notifier", (req, res) => {
   const expiresAt = body.expires_at ? parseInt(body.expires_at, 10) : 0;
   setSetting("access_token", body.access_token);
   setSetting("access_token_expiry", String(expiresAt));
+  // Clear all caches on new token
+  _optionContractsCache = {};
   console.log(`[NOTIFIER] Access token stored! Expires at: ${new Date(expiresAt).toISOString()}`);
+  console.log(`[NOTIFIER] All caches cleared — fresh start`);
   addLog("INFO", `Access token stored, expires at ${new Date(expiresAt).toISOString()}`);
+  addLog("INFO", `Caches cleared on new token`);
+  // Clear old error signals from previous token session
+  try { db.prepare("DELETE FROM signals WHERE status = 'order_api_error'").run(); console.log("[NOTIFIER] Old error signals cleared"); } catch(e) {}
   res.status(200).json({ status: "token_stored", expires_at: expiresAt });
 });
 
@@ -1015,6 +1021,7 @@ app.get("/api/exit-config", (req, res) => res.json(getExitConfig()));
 app.post("/api/exit-config", (req, res) => {
   const merged = { ...DEFAULT_EXIT_CONFIG, ...req.body };
   setSetting("exit_config", JSON.stringify(merged));
+  console.log(`[EXIT] Exit config saved`);
   res.json({ status: "saved", config: merged });
 });
 
@@ -1034,6 +1041,8 @@ app.post("/api/settings", (req, res) => {
   if (req.body.upstox_client_secret) setSetting("UPSTOX_CLIENT_SECRET", req.body.upstox_client_secret);
   if (req.body.webhook_secret) setSetting("WEBHOOK_SECRET", req.body.webhook_secret);
     if (req.body.dash_pass) setSetting("DASHBOARD_PASSWORD", req.body.dash_pass);
+  _optionContractsCache = {};
+  console.log(`[SETTINGS] Settings saved, caches cleared`);
   res.json({ status: "saved" });
 });
 
@@ -1046,7 +1055,9 @@ app.post("/api/trading-config", (req, res) => {
   const current = getTradingConfig();
   const updated = { ...current, ...req.body };
   setSetting("trading_config", JSON.stringify(updated));
+  _optionContractsCache = {};
   console.log(`[CONFIG] Trading config saved: ${JSON.stringify(updated)}`);
+  console.log(`[CONFIG] Option contracts cache cleared`);
   res.json({ status: "saved", config: updated });
 });
 

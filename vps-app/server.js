@@ -789,9 +789,12 @@ app.post("/webhook", async (req, res) => {
 
   let result;
   try {
+    // Always use LIMIT order with LTP as price — avoids circuit limit margin issue
+    const orderLTP = entryPrice || 0;
     result = await placeUpstoxOrder(token, {
-      quantity, product: (matchingPosition ? (matchingPosition.product || 'D') : (payload.product || 'D')), validity: payload.validity, price: payload.price,
-      order_type: payload.order_type || "MARKET", transaction_type: action, instrument_token: instrumentToken,
+      quantity, product: (matchingPosition ? (matchingPosition.product || 'D') : (payload.product || legProduct || 'D')), validity: "DAY",
+      price: orderLTP || 0,
+      order_type: "LIMIT", transaction_type: action, instrument_token: instrumentToken,
     });
   } catch (err) {
     logSignal(rawText.substring(0, 1000), payload, "order_api_error");

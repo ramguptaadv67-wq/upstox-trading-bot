@@ -763,11 +763,16 @@ app.post("/webhook", async (req, res) => {
   if (action === "SELL") {
     const activePositions = db.prepare("SELECT * FROM positions WHERE active = 1").all();
     if (legOptionType) {
-      // sell_ce or sell_pe — match by option type (CE/PE) in instrument_token
-      matchingPosition = activePositions.find(p =>
-        p.transaction_type === "BUY" &&
-        p.instrument_token && p.instrument_token.includes(legOptionType)
-      );
+      // sell_ce or sell_pe — match by option type stored in exit_config
+      matchingPosition = activePositions.find(p => {
+        if (p.transaction_type !== "BUY") return false;
+        try {
+          const ec = p.exit_config ? JSON.parse(p.exit_config) : {};
+          if (ec.option_type) return ec.option_type === legOptionType;
+        } catch(e) {}
+        // Fallback: also check instrument_token (for old positions without option_type)
+        return p.instrument_token && p.instrument_token.includes(legOptionType);
+      });
     } else {
       // Plain SELL — match any active BUY position
       matchingPosition = activePositions.find(p => p.transaction_type === "BUY");
@@ -832,6 +837,7 @@ app.post("/webhook", async (req, res) => {
       }
       const ltp = actualFillPrice || entryPrice || 0;
       const posExit = {};
+      if (legOptionType) posExit.option_type = legOptionType;
       if (useExit) {
         let hasFixed = false, hasTrailing = false;
         if (exitTargetPoints) { posExit.fixed_target_points = exitTargetPoints; hasFixed = true; }

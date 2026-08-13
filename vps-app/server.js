@@ -194,23 +194,14 @@ const DEFAULT_TRADING_CONFIG = {
   option_type: "CE",                // CE or PE (default leg)
   lots: 1,
   product: "D",
-  exit_target_points: 40,
-  exit_sl_points: 25,
-  trailing_sl_points: 15,
-  trailing_activation_points: 10,
-  use_exit: true,
   // --- CE leg (Buy CE alerts) ---
   ce_enabled: true,
   ce_lots: 1,
   ce_product: "D",
-  ce_exit_target_points: 40,
-  ce_exit_sl_points: 25,
   // --- PE leg (Buy PE alerts) ---
   pe_enabled: true,
   pe_lots: 1,
   pe_product: "D",
-  pe_exit_target_points: 40,
-  pe_exit_sl_points: 25,
 };
 
 function getTradingConfig() {
@@ -730,13 +721,13 @@ app.post("/webhook", async (req, res) => {
     if (legOptionType === "CE") {
       legLots = tcfg.ce_lots ?? tcfg.lots ?? 1;
       legProduct = tcfg.ce_product ?? tcfg.product ?? "D";
-      legExitTarget = tcfg.ce_exit_target_points ?? tcfg.exit_target_points ?? 40;
-      legExitSL = tcfg.ce_exit_sl_points ?? tcfg.exit_sl_points ?? 25;
+      legExitTarget = parseFloat(payload.exit_target_points ?? 40);
+      legExitSL = parseFloat(payload.exit_sl_points ?? 25);
     } else {
       legLots = tcfg.pe_lots ?? tcfg.lots ?? 1;
       legProduct = tcfg.pe_product ?? tcfg.product ?? "D";
-      legExitTarget = tcfg.pe_exit_target_points ?? tcfg.exit_target_points ?? 40;
-      legExitSL = tcfg.pe_exit_sl_points ?? tcfg.exit_sl_points ?? 25;
+      legExitTarget = parseFloat(payload.exit_target_points ?? 40);
+      legExitSL = parseFloat(payload.exit_sl_points ?? 25);
     }
 
     console.log(`[WEBHOOK] Mode 2: Auto-ATM for ${tcfg.underlying_name} ${legOptionType} (leg: ${legLots} lots, ${legProduct})`);
@@ -750,9 +741,7 @@ app.post("/webhook", async (req, res) => {
     entryPrice = await getLTP(token, atm.instrument_key);
     console.log(`[WEBHOOK] Option LTP for ${atm.trading_symbol}: ${entryPrice}`);
     if (!entryPrice) { console.log('[WEBHOOK] WARNING: Option LTP fetch failed, using spot as fallback'); entryPrice = atm.spot; }
-    // Override payload exit values with leg-specific values for exit tracking
-    payload.exit_target_points = legExitTarget;
-    payload.exit_sl_points = legExitSL;
+    // Exit conditions come from webhook payload (or defaults)
     payload.product = legProduct;
     console.log(`[WEBHOOK] ATM: ${atm.atm_strike} ${legOptionType} (spot ${atm.spot}), token ${instrumentToken}, qty ${quantity}`);
   }
@@ -822,11 +811,11 @@ app.post("/webhook", async (req, res) => {
     try {
       const tcfg = getTradingConfig();
       const config = getExitConfig();
-      const useExit = tcfg.use_exit || (config.enabled && config.mode !== "none");
-      const exitTargetPoints = payload.exit_target_points ?? tcfg.exit_target_points;
-      const exitSLPoints = payload.exit_sl_points ?? tcfg.exit_sl_points;
-      const trailSLPoints = payload.trailing_sl_points ?? tcfg.trailing_sl_points;
-      const trailActPoints = payload.trailing_activation_points ?? tcfg.trailing_activation_points;
+      const useExit = true; // Exit conditions come from webhook signal
+      const exitTargetPoints = parseFloat(payload.exit_target_points ?? 0);
+      const exitSLPoints = parseFloat(payload.exit_sl_points ?? 0);
+      const trailSLPoints = parseFloat(payload.trailing_sl_points ?? 0);
+      const trailActPoints = parseFloat(payload.trailing_activation_points ?? 0);
 
       // ALWAYS track position — even if exit tracking is disabled
       // Fetch actual fill price from Upstox (not estimated LTP)
@@ -1205,7 +1194,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   <div class="tab" onclick="showTab('signals',this)">Signals</div>
   <div class="tab" onclick="showTab('orders',this)">Orders</div>
   <div class="tab" onclick="showTab('positions',this)">Positions</div>
-  <div class="tab" onclick="showTab('exit',this)" style="display:none">Exit Conditions</div>
+  
   <div class="tab" onclick="showTab('settings',this)">⚙️ Settings</div>
 </div>
 
@@ -1232,7 +1221,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   </div>
   <div class="form-row">
     <div><label>8. Exit Target (pts)</label><input id="obExitTarget" type="number" placeholder="40" onchange="updateJSON()"></div>
-    <div><label>9. Exit SL (pts)</label><input id="obExitSL" type="number" placeholder="25" onchange="updateJSON()"></div>
+    
     <div><label>10. Trailing SL (pts)</label><input id="obTrailSL" type="number" placeholder="15" onchange="updateJSON()"></div>
     <div><label>11. Activate Trail (pts)</label><input id="obTrailAct" type="number" placeholder="10" onchange="updateJSON()"></div>
   </div>
@@ -1281,10 +1270,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
       </div>
       <div><label>Lots</label><input id="tcCeLots" type="number" value="1" min="1"></div>
       <div style="margin-top:6px;"><label>Product</label><select id="tcCeProduct"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
-      <div class="form-row" style="margin-top:6px;">
-        <div><label>Exit Target (pts)</label><input id="tcCeExitTarget" type="number" value="40"></div>
-        <div><label>Exit SL (pts)</label><input id="tcCeExitSL" type="number" value="25"></div>
-      </div>
+      
     </div>
     <div style="background:var(--bg);border:1px solid var(--red);border-radius:8px;padding:12px;">
       <h3 style="color:var(--red);margin-bottom:8px;font-size:0.95rem;">🔴 PE Leg (Buy PE alerts)</h3>
@@ -1294,29 +1280,10 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
       </div>
       <div><label>Lots</label><input id="tcPeLots" type="number" value="1" min="1"></div>
       <div style="margin-top:6px;"><label>Product</label><select id="tcPeProduct"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
-      <div class="form-row" style="margin-top:6px;">
-        <div><label>Exit Target (pts)</label><input id="tcPeExitTarget" type="number" value="40"></div>
-        <div><label>Exit SL (pts)</label><input id="tcPeExitSL" type="number" value="25"></div>
-      </div>
+      
     </div>
   </div>
-  <div class="section-divider"></div>
-  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Trailing Stop Loss (applies to both legs)</h2>
-  <div class="form-row">
-    <div><label>Trailing SL (pts)</label><input id="tcTrailSL" type="number" value="15"></div>
-    <div><label>Activate Trail (pts)</label><input id="tcTrailAct" type="number" value="10"></div>
-  </div>
-  <div class="form-row" style="align-items:center;">
-    <label class="toggle"><input type="checkbox" id="tcUseExit" checked><span class="slider"></span></label>
-    <span style="margin-left:8px;font-weight:600;">Enable exit tracking for webhook orders</span>
-  </div>
-  <div class="section-divider"></div>
-  <div class="form-row">
-    <button class="btn btn-success" onclick="saveTradingConfig()">Save Config</button>
-    <button class="btn btn-secondary" onclick="loadTradingConfig()">Refresh</button>
-  </div>
-  <div id="tcStatus" class="muted" style="margin-top:8px;"></div>
-  <div class="section-divider"></div>
+  
   <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">TradingView Webhook Setup</h2>
   <p class="muted" style="margin-bottom:6px;">Webhook URL:</p>
   <div class="json-box" id="tcWebhookUrl" style="font-size:0.75rem;"></div>
@@ -1389,30 +1356,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   <div id="btResults" style="margin-top:12px;max-height:400px;overflow-y:auto;"></div>
 </div>
 
-<div id="tab-exit" class="card hidden">
-  <h2>Exit Conditions</h2>
-  <p class="muted" style="margin-bottom:12px;">Configure automatic exit rules for webhook-placed orders.</p>
-  <div class="form-row" style="align-items:center;">
-    <label class="toggle"><input type="checkbox" id="exitEnabled"><span class="slider"></span></label>
-    <span style="margin-left:8px;font-weight:600;">Enable Exit Engine</span>
-  </div>
-  <div class="section-divider"></div>
-  <div class="form-row">
-    <div><label>Mode</label><select id="exitMode"><option value="none">None</option><option value="fixed_sl_target">Fixed SL + Target</option><option value="trailing_sl">Trailing SL</option><option value="both">Both</option></select></div>
-  </div>
-  <div class="form-row">
-    <div><label>Trailing SL (pts)</label><input id="trailSL" type="number" value="20"></div>
-    <div><label>Activate Trail After (pts)</label><input id="trailAct" type="number" value="10"></div>
-  </div>
-  <div class="form-row">
-    <div><label>Fixed SL (pts)</label><input id="fixedSL" type="number" value="30"></div>
-    <div><label>Fixed Target (pts)</label><input id="fixedTarget" type="number" value="40"></div>
-  </div>
-  <div class="form-row" style="margin-top:10px;">
-    <button class="btn btn-success" onclick="saveExitConfig()">Save</button>
-    <button class="btn btn-secondary" onclick="loadExitConfig()">Refresh</button>
-  </div>
-</div>
+
 
 <div id="tab-settings" class="card hidden">
   <h2>⚙️ Settings</h2>
@@ -1444,7 +1388,7 @@ document.addEventListener('DOMContentLoaded',function(){document.title=document.
 const api=async(p,o)=>{try{const r=await fetch(p,o);if(!r.ok){console.error('API error:',r.status,p);return{error:'HTTP '+r.status};}return await r.json();}catch(e){console.error('API fetch error:',e.message,p);return{error:e.message};}};
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',3500);}
 function fmtTime(ts){return ts?new Date(ts).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:false}):'—';}
-let _activeTab='';function showTab(n,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');document.querySelectorAll('[id^="tab-"]').forEach(d=>d.classList.add('hidden'));document.getElementById('tab-'+n).classList.remove('hidden');_activeTab=n;if(n==='signals')loadSignals();if(n==='orders')loadOrders();if(n==='positions')loadPositions();if(n==='exit')loadExitConfig();if(n==='settings')loadSettings();if(n==='auto')loadTradingConfig();if(n==='strategy')loadStratConfig();if(n==='backtest')loadBacktestStrats();}
+let _activeTab='';function showTab(n,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');document.querySelectorAll('[id^="tab-"]').forEach(d=>d.classList.add('hidden'));document.getElementById('tab-'+n).classList.remove('hidden');_activeTab=n;if(n==='signals')loadSignals();if(n==='orders')loadOrders();if(n==='positions')loadPositions();if(n==='settings')loadSettings();if(n==='auto')loadTradingConfig();if(n==='strategy')loadStratConfig();if(n==='backtest')loadBacktestStrats();}
 let obState={instrumentKey:null,lotSize:1,instrumentToken:null};
 async function loadStatus(){try{const s=await api('/api/token-status');if(!s||s.error){document.getElementById('tokenText').textContent='Error';return;}const d=document.getElementById('tokenDot'),t=document.getElementById('tokenText');if(!s.has_token){d.className='dot red';t.textContent='No token';}else if(s.is_expired){d.className='dot red';t.textContent='EXPIRED';}else{d.className='dot green';t.textContent='Valid until '+fmtTime(s.expires_at);}document.getElementById('killToggle').checked=s.kill_switch;document.getElementById('killText').textContent=s.kill_switch?'OFF':'ON';document.getElementById('killBanner').classList.toggle('hidden',!s.kill_switch);api('/health').then(h=>{if(h&&!h.error)document.getElementById('marketStatus').textContent=h.market_open?'OPEN':'CLOSED';});}catch(e){console.error('loadStatus error:',e);}}
 async function requestToken(){document.getElementById('tokenBtn').disabled=true;try{const r=await api('/api/request-token',{method:'POST'});if(r.ok){toast('✅ Token request sent — approve on Upstox app');}else{const msg=(r.data&&(r.data.message||r.data.error||JSON.stringify(r.data)))||'HTTP '+r.status;toast('❌ Failed: '+msg);}}catch(e){toast('❌ Network error: '+e.message);}document.getElementById('tokenBtn').disabled=false;setTimeout(loadStatus,3000);}
@@ -1452,9 +1396,9 @@ async function toggleKillSwitch(){const isOn=document.getElementById('killToggle
 async function loadInstruments(){try{const r=await api('/api/instruments');if(!r||r.error){console.error('loadInstruments error');return;}const ob=document.getElementById('obInstrument');if(ob){ob.innerHTML='<option value="">— Select —</option>';r.instruments.forEach(i=>ob.innerHTML+='<option value="'+i.key+'" data-lot="'+i.lot_size+'">'+i.name+' (lot: '+i.lot_size+')</option>');}const tc=document.getElementById('tcUnderlying');if(tc){tc.innerHTML='';r.instruments.forEach(i=>tc.innerHTML+='<option value="'+i.key+'" data-lot="'+i.lot_size+'">'+i.name+' (lot: '+i.lot_size+')</option>');}}catch(e){console.error('loadInstruments error:',e);}}
 function onTcInstrumentChange(){const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value)return;const lot=parseInt(o.dataset.lot||'1',10);const ls=document.getElementById('tcLotSize');if(ls)ls.value=lot;updateTcQty(lot);}
 function updateTcQty(lot){const ls=document.getElementById('tcLotSize');if(!lot)lot=parseInt(ls&&ls.value||'65',10);const ceLots=parseInt(document.getElementById('tcCeLots').value||'1',10);const peLots=parseInt(document.getElementById('tcPeLots').value||'1',10);const ceq=document.getElementById('tcCeQty');const peq=document.getElementById('tcPeQty');if(ceq)ceq.value=ceLots*lot;if(peq)peq.value=peLots*lot;}
-async function loadTradingConfig(){try{const c=await api('/api/trading-config');if(!c||c.error){console.error('loadTradingConfig error');return;}const s=document.getElementById('tcUnderlying');if(s&&c.underlying){for(let i=0;i<s.options.length;i++){if(s.options[i].value===c.underlying){s.selectedIndex=i;break;}}onTcInstrumentChange();}document.getElementById('tcCeEnabled').checked=c.ce_enabled!==false;document.getElementById('tcCeLots').value=c.ce_lots||c.lots||1;document.getElementById('tcCeProduct').value=c.ce_product||c.product||'D';document.getElementById('tcCeExitTarget').value=c.ce_exit_target_points||c.exit_target_points||40;document.getElementById('tcCeExitSL').value=c.ce_exit_sl_points||c.exit_sl_points||25;document.getElementById('tcPeEnabled').checked=c.pe_enabled!==false;document.getElementById('tcPeLots').value=c.pe_lots||c.lots||1;document.getElementById('tcPeProduct').value=c.pe_product||c.product||'D';document.getElementById('tcPeExitTarget').value=c.pe_exit_target_points||c.exit_target_points||40;document.getElementById('tcPeExitSL').value=c.pe_exit_sl_points||c.exit_sl_points||25;document.getElementById('tcTrailSL').value=c.trailing_sl_points||15;document.getElementById('tcTrailAct').value=c.trailing_activation_points||10;document.getElementById('tcUseExit').checked=c.use_exit!==false;const wu=await api('/api/webhook-url');document.getElementById('tcWebhookUrl').textContent=wu.url||'Set WEBHOOK_SECRET in Settings first';document.getElementById('tcStatus').innerHTML='Config loaded';if(c.lot_size)document.getElementById('tcLotSize').value=c.lot_size;updateTcQty(c.lot_size||65);}catch(e){console.error('loadTradingConfig error:',e);}}
+async function loadTradingConfig(){try{const c=await api('/api/trading-config');if(!c||c.error){console.error('loadTradingConfig error');return;}const s=document.getElementById('tcUnderlying');if(s&&c.underlying){for(let i=0;i<s.options.length;i++){if(s.options[i].value===c.underlying){s.selectedIndex=i;break;}}onTcInstrumentChange();}document.getElementById('tcCeEnabled').checked=c.ce_enabled!==false;document.getElementById('tcCeLots').value=c.ce_lots||c.lots||1;document.getElementById('tcCeProduct').value=c.ce_product||c.product||'D';document.getElementById('tcPeEnabled').checked=c.pe_enabled!==false;document.getElementById('tcPeLots').value=c.pe_lots||c.lots||1;document.getElementById('tcPeProduct').value=c.pe_product||c.product||'D';const wu=await api('/api/webhook-url');document.getElementById('tcWebhookUrl').textContent=wu.url||'Set WEBHOOK_SECRET in Settings first';document.getElementById('tcStatus').innerHTML='Config loaded';if(c.lot_size)document.getElementById('tcLotSize').value=c.lot_size;updateTcQty(c.lot_size||65);}catch(e){console.error('loadTradingConfig error:',e);}}
 function getSetting_webhook_secret_hint(){return '';}
-async function saveTradingConfig(){try{const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value){toast('Select underlying');return;}const lot=parseInt(document.getElementById('tcLotSize').value||o.dataset.lot||'65',10);const b={underlying:o.value,underlying_name:o.text.split(' (')[0],lot_size:lot,option_type:'CE',lots:parseInt(document.getElementById('tcCeLots').value||'1',10),product:document.getElementById('tcCeProduct').value,exit_target_points:parseFloat(document.getElementById('tcCeExitTarget').value||0),exit_sl_points:parseFloat(document.getElementById('tcCeExitSL').value||0),ce_enabled:document.getElementById('tcCeEnabled').checked,ce_lots:parseInt(document.getElementById('tcCeLots').value||'1',10),ce_product:document.getElementById('tcCeProduct').value,ce_exit_target_points:parseFloat(document.getElementById('tcCeExitTarget').value||0),ce_exit_sl_points:parseFloat(document.getElementById('tcCeExitSL').value||0),pe_enabled:document.getElementById('tcPeEnabled').checked,pe_lots:parseInt(document.getElementById('tcPeLots').value||'1',10),pe_product:document.getElementById('tcPeProduct').value,pe_exit_target_points:parseFloat(document.getElementById('tcPeExitTarget').value||0),pe_exit_sl_points:parseFloat(document.getElementById('tcPeExitSL').value||0),trailing_sl_points:parseFloat(document.getElementById('tcTrailSL').value||0),trailing_activation_points:parseFloat(document.getElementById('tcTrailAct').value||0),use_exit:document.getElementById('tcUseExit').checked};const r=await api('/api/trading-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});if(r&&r.error){toast('❌ Save failed: '+r.error);return;}toast('✅ Trading config saved!');console.log('[CONFIG] Save response:',JSON.stringify(r));}catch(e){toast('❌ Error: '+e.message);}}
+async function saveTradingConfig(){try{const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value){toast('Select underlying');return;}const lot=parseInt(document.getElementById('tcLotSize').value||o.dataset.lot||'65',10);const b={underlying:o.value,underlying_name:o.text.split(' (')[0],lot_size:lot,option_type:'CE',lots:parseInt(document.getElementById('tcCeLots').value||'1',10),product:document.getElementById('tcCeProduct').value,ce_enabled:document.getElementById('tcCeEnabled').checked,ce_lots:parseInt(document.getElementById('tcCeLots').value||'1',10),ce_product:document.getElementById('tcCeProduct').value,pe_enabled:document.getElementById('tcPeEnabled').checked,pe_lots:parseInt(document.getElementById('tcPeLots').value||'1',10),pe_product:document.getElementById('tcPeProduct').value};const r=await api('/api/trading-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});if(r&&r.error){toast('❌ Save failed: '+r.error);return;}toast('✅ Trading config saved!');console.log('[CONFIG] Save response:',JSON.stringify(r));}catch(e){toast('❌ Error: '+e.message);}}
 function copyTcWebhookUrl(){const u=document.getElementById('tcWebhookUrl').textContent;navigator.clipboard.writeText(u).then(()=>toast('✅ Webhook URL copied!'));}
 let _strategies = {};
 let _stratParams = {};
@@ -1638,8 +1582,6 @@ async function loadOrders(){const d=await api('/api/orders');const b=document.ge
 async function loadPositions(){const d=await api('/api/positions');const b=document.getElementById('positionsBody');if(!d||d.length===0){b.innerHTML='<tr><td colspan="6" class="muted">No positions</td></tr>';return;}b.innerHTML=d.map(p=>'<tr><td>'+(p.instrument_token||'').substring(0,25)+'</td><td><span class="pill '+(p.transaction_type==='BUY'?'buy':'sell')+'">'+p.transaction_type+'</span></td><td>'+p.quantity+'</td><td>'+p.entry_price+'</td><td>'+(p.highest_price||p.lowest_price||'—')+'</td><td><button class="btn btn-danger" style="padding:4px 12px;font-size:0.8rem;" onclick="exitPosition('+p.id+')">Exit</button></td></tr>').join('');}
 async function loadUpstoxPositions(){const r=await api('/api/upstox-positions');const b=document.getElementById('positionsBody');if(r.error){b.innerHTML='<tr><td colspan="6" class="muted">Error: '+r.error+'</td></tr>';return;}const ps=(r.data&&r.data.data)||[];if(ps.length===0){b.innerHTML='<tr><td colspan="6" class="muted">No live positions</td></tr>';return;}b.innerHTML=ps.map(p=>'<tr><td>'+(p.instrument_token||'').substring(0,25)+'</td><td><span class="pill '+(p.transaction_type==='BUY'?'buy':'sell')+'">'+(p.transaction_type||'')+'</span></td><td>'+p.quantity+'</td><td>'+p.average_price+'</td><td>'+p.last_price+'</td><td>—</td></tr>').join('');}
 async function exitPosition(id){if(!confirm('Exit this position now? This places a MARKET order.'))return;try{const r=await api('/api/exit-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});if(r.ok){toast('✅ Exit order placed!');loadPositions();}else{toast('❌ Exit failed: '+(r.error||'unknown'));}}catch(e){toast('❌ Error: '+e.message);}}
-async function loadExitConfig(){const c=await api('/api/exit-config');document.getElementById('exitEnabled').checked=c.enabled;document.getElementById('exitMode').value=c.mode;document.getElementById('trailSL').value=c.trailing_sl_points;document.getElementById('trailAct').value=c.trailing_activation_points;document.getElementById('fixedSL').value=c.fixed_sl_points;document.getElementById('fixedTarget').value=c.fixed_target_points;}
-async function saveExitConfig(){const b={enabled:document.getElementById('exitEnabled').checked,mode:document.getElementById('exitMode').value,trailing_sl_points:parseFloat(document.getElementById('trailSL').value),trailing_activation_points:parseFloat(document.getElementById('trailAct').value),fixed_sl_points:parseFloat(document.getElementById('fixedSL').value),fixed_target_points:parseFloat(document.getElementById('fixedTarget').value)};await api('/api/exit-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});toast('✅ Saved!');}
 async function loadSettings(){const s=await api('/api/settings');document.getElementById('setClientId').value=s.upstox_client_id||'';document.getElementById('setClientSecret').value='';document.getElementById('setWebhookSecret').value='';let p=[];p.push(s.has_client_id?'✅ API Key':'❌ API Key');p.push(s.has_client_secret?'✅ Secret':'❌ Secret');p.push(s.has_webhook_secret?'✅ Webhook':'❌ Webhook');document.getElementById('settingsStatus').innerHTML=p.join(' &nbsp; ');}
 async function saveSettings(){const b={};const ci=document.getElementById('setClientId').value.trim(),cs=document.getElementById('setClientSecret').value.trim(),ws=document.getElementById('setWebhookSecret').value.trim();if(ci)b.upstox_client_id=ci;if(cs)b.upstox_client_secret=cs;if(ws)b.webhook_secret=ws;if(!ci&&!cs&&!ws){toast('No changes');return;}await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});toast('✅ Saved!');loadSettings();loadStatus();}
 async function loadBacktestStrats(){try{const c=await api('/api/strategy-config');const strats=await api('/api/strategies');const sel=document.getElementById('btStrategy');sel.innerHTML='';for(const[key,val]of Object.entries(strats.strategies||{})){sel.innerHTML+='<option value="'+key+'">'+val.name+'</option>';}if(c.strategy)sel.value=c.strategy;sel.disabled=false;}catch(e){console.error('loadBacktestStrats error:',e);}}

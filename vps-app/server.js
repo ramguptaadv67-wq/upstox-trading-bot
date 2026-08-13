@@ -757,9 +757,9 @@ app.post("/webhook", async (req, res) => {
 
   // SAFETY GUARD: If action is SELL, check if there's an active BUY position to exit.
   // Reject naked short sells — prevents accidental sell orders without a prior buy.
+  let matchingPosition = null;
   if (action === "SELL") {
     const activePositions = db.prepare("SELECT * FROM positions WHERE active = 1").all();
-    let matchingPosition = null;
     if (legOptionType) {
       // sell_ce or sell_pe — match by option type (CE/PE) in instrument_token
       matchingPosition = activePositions.find(p =>

@@ -747,7 +747,9 @@ app.post("/webhook", async (req, res) => {
     }
     instrumentToken = atm.instrument_key;
     quantity = parseInt(legLots, 10) * parseInt(tcfg.lot_size, 10);
-    entryPrice = atm.spot;
+    entryPrice = await getLTP(token, atm.instrument_key);
+    console.log(`[WEBHOOK] Option LTP for ${atm.trading_symbol}: ${entryPrice}`);
+    if (!entryPrice) { console.log('[WEBHOOK] WARNING: Option LTP fetch failed, using spot as fallback'); entryPrice = atm.spot; }
     // Override payload exit values with leg-specific values for exit tracking
     payload.exit_target_points = legExitTarget;
     payload.exit_sl_points = legExitSL;

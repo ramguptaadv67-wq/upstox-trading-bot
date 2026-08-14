@@ -359,6 +359,14 @@ async function placeUpstoxOrder(accessToken, order) {
   if (resp.ok && !orderAccepted) {
     console.log(`[ORDER] WARNING: HTTP 200 but order may not be accepted: ${text.substring(0, 200)}`);
   }
+  // Check for exchange rejection in response body (margin errors, etc.)
+  const rejectKeywords = ["margin", "insufficient", "rejected", "failed", "error", "you need to add"];
+  const responseStr = text.toLowerCase();
+  const isRejected = !orderAccepted || rejectKeywords.some(k => responseStr.includes(k) && !responseStr.includes('"status":"success"'));
+  if (isRejected) {
+    console.log(`[ORDER] REJECTED by exchange: ${text.substring(0, 300)}`);
+    return { ok: false, status: resp.status, data: { ...data, _rejection_detected: true } };
+  }
   if (orderAccepted) incrementTradeCount();
   return { ok: orderAccepted, status: resp.status, data };
 }
@@ -810,6 +818,11 @@ app.post("/webhook", async (req, res) => {
       if (marginInfo) {
         console.log(`[HEDGE] Margin: required=${marginInfo.required_margin}, final=${marginInfo.final_margin} (benefit: ${marginInfo.benefit})`);
         addLog("INFO", `Hedge margin: required ${marginInfo.required_margin}, after benefit ${marginInfo.final_margin} (save ${Math.round(marginInfo.benefit)})`);
+        // Pre-check: if final margin is too high, reject before placing any orders
+        // We can't check exact balance, but log a warning
+        if (marginInfo.final_margin > 100000) {
+          addLog("WARN", `Hedge requires ${marginInfo.final_margin} margin — ensure sufficient funds`);
+        }
       }
 
       // Place BOTH orders simultaneously
@@ -819,10 +832,21 @@ app.post("/webhook", async (req, res) => {
       ]);
       console.log(`[HEDGE] PE order: ${peOrder.ok ? "OK" : "FAILED"}, Fut order: ${futOrder.ok ? "OK" : "FAILED"}`);
       if (!peOrder.ok || !futOrder.ok) {
-        if (peOrder.ok && !futOrder.ok) { console.log("[HEDGE] Futures failed — closing PE"); await placeExitOrder(token, peContract.instrument_key, optQty, "SELL", legProduct); }
-        if (futOrder.ok && !peOrder.ok) { console.log("[HEDGE] PE failed — closing futures"); await placeExitOrder(token, futResult.instrument_key, futQty, "SELL", legProduct); }
+        // One leg failed — reverse the successful one IMMEDIATELY
+        if (peOrder.ok && !futOrder.ok) {
+          console.log("[HEDGE] Futures FAILED — reversing PE leg immediately");
+          const reversePe = await placeExitOrder(token, peContract.instrument_key, optQty, "SELL", legProduct);
+          console.log(`[HEDGE] PE reversal: ${reversePe.ok ? "OK" : "FAILED"}`);
+          if (!reversePe.ok) addLog("ERROR", `CRITICAL: PE reversal failed — manual exit needed for ${peContract.instrument_key}`);
+        }
+        if (futOrder.ok && !peOrder.ok) {
+          console.log("[HEDGE] PE FAILED — reversing futures leg immediately");
+          const reverseFut = await placeExitOrder(token, futResult.instrument_key, futQty, "SELL", legProduct);
+          console.log(`[HEDGE] Futures reversal: ${reverseFut.ok ? "OK" : "FAILED"}`);
+          if (!reverseFut.ok) addLog("ERROR", `CRITICAL: Futures reversal failed — manual exit needed for ${futResult.instrument_key}`);
+        }
         logSignal(rawText.substring(0, 1000), payload, "hedge_partial_fail");
-        return res.json({ status: "error", message: "One hedge leg failed — other reversed" });
+        return res.json({ status: "error", message: "One hedge leg failed — other leg reversed. Check funds." });
       }
 
       // Track futures position
@@ -919,10 +943,18 @@ app.post("/webhook", async (req, res) => {
         placeUpstoxOrder(token, { quantity: futQty, product: legProduct, validity: "DAY", order_type: "MARKET", transaction_type: "SELL", instrument_token: futResult.instrument_key, tag: "hedge_fut" })
       ]);
       if (!ceOrder.ok || !futOrder.ok) {
-        if (ceOrder.ok && !futOrder.ok) { await placeExitOrder(token, ceContract.instrument_key, optQty, "SELL", legProduct); }
-        if (futOrder.ok && !ceOrder.ok) { await placeExitOrder(token, futResult.instrument_key, futQty, "BUY", legProduct); }
+        if (ceOrder.ok && !futOrder.ok) {
+          console.log("[HEDGE] Futures FAILED — reversing CE leg immediately");
+          const reverseCe = await placeExitOrder(token, ceContract.instrument_key, optQty, "SELL", legProduct);
+          if (!reverseCe.ok) addLog("ERROR", `CRITICAL: CE reversal failed — manual exit needed for ${ceContract.instrument_key}`);
+        }
+        if (futOrder.ok && !ceOrder.ok) {
+          console.log("[HEDGE] CE FAILED — reversing futures leg immediately");
+          const reverseFut = await placeExitOrder(token, futResult.instrument_key, futQty, "BUY", legProduct);
+          if (!reverseFut.ok) addLog("ERROR", `CRITICAL: Futures reversal failed — manual exit needed for ${futResult.instrument_key}`);
+        }
         logSignal(rawText.substring(0, 1000), payload, "hedge_partial_fail");
-        return res.json({ status: "error", message: "One hedge leg failed — other reversed" });
+        return res.json({ status: "error", message: "One hedge leg failed — other leg reversed. Check funds." });
       }
 
       db.prepare("INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active, hedge_id, leg_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")

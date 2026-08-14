@@ -272,6 +272,30 @@ async function findFuturesContract(accessToken, instrumentKey) {
   return { instrument_key: fut.instrument_key, trading_symbol: fut.trading_symbol, lot_size: fut.lot_size, expiry: nearestExpiry };
 }
 
+// --- Check available funds/margin in Upstox account ---
+// GET /user/get-funds-and-margin returns available_margin
+async function getAvailableFunds(accessToken) {
+  try {
+    const resp = await fetchIPv4("https://api.upstox.com/v2/user/get-funds-and-margin?segment=SEC", {
+      headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` },
+    });
+    const text = await resp.text();
+    let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    if (!resp.ok || !data || !data.data || !data.data.equity) {
+      console.log(`[FUNDS] API failed: ${text.substring(0, 200)}`);
+      return null;
+    }
+    const available = data.data.equity.available_margin || 0;
+    const used = data.data.equity.used_margin || 0;
+    console.log(`[FUNDS] Available: ${available}, Used: ${used}`);
+    return { available_margin: available, used_margin: used };
+  } catch (e) {
+    console.log(`[FUNDS] Error: ${e.message}`);
+    return null;
+  }
+}
+
+
 // --- Check basket margin for hedge (futures + option) ---
 async function getBasketMargin(accessToken, instruments) {
   try {
@@ -818,14 +842,20 @@ app.post("/webhook", async (req, res) => {
       if (marginInfo) {
         console.log(`[HEDGE] Margin: required=${marginInfo.required_margin}, final=${marginInfo.final_margin} (benefit: ${marginInfo.benefit})`);
         addLog("INFO", `Hedge margin: required ${marginInfo.required_margin}, after benefit ${marginInfo.final_margin} (save ${Math.round(marginInfo.benefit)})`);
-        // Pre-check: if final margin is too high, reject before placing any orders
-        // We can't check exact balance, but log a warning
-        if (marginInfo.final_margin > 100000) {
-          addLog("WARN", `Hedge requires ${marginInfo.final_margin} margin — ensure sufficient funds`);
-        }
       }
 
-      // Place OPTION FIRST (hedge), then FUTURES — so exchange gives margin benefit
+      // Step 1: Check available funds BEFORE placing any orders
+      const funds = await getAvailableFunds(token);
+      console.log(`[HEDGE] Available funds: ${funds ? funds.available_margin : 'unknown'}`);
+      if (funds && marginInfo && marginInfo.final_margin > funds.available_margin) {
+        const shortfall = Math.ceil(marginInfo.final_margin - funds.available_margin);
+        console.log(`[HEDGE] INSUFFICIENT FUNDS: need ${marginInfo.final_margin}, have ${funds.available_margin}, shortfall ${shortfall}`);
+        logSignal(rawText.substring(0, 1000), payload, "hedge_insufficient_funds");
+        addLog("ERROR", `Hedge rejected: need ${marginInfo.final_margin} margin, have ${funds.available_margin}. Add ${shortfall} to account.`);
+        return res.json({ status: "error", message: `Insufficient funds. Need ${marginInfo.final_margin} margin (after hedge benefit), have ${funds.available_margin}. Please add ${shortfall} to your Upstox account.` });
+      }
+
+      // Step 2: Place OPTION (hedge) FIRST — exchange registers hedge position
       console.log("[HEDGE] Step 1: Placing PE (hedge) order first...");
       const peOrder = await placeUpstoxOrder(token, { quantity: optQty, product: legProduct, validity: "DAY", order_type: "MARKET", transaction_type: "BUY", instrument_token: peContract.instrument_key, tag: "hedge_pe" });
       console.log(`[HEDGE] PE order: ${peOrder.ok ? "OK" : "FAILED"}`);
@@ -833,8 +863,8 @@ app.post("/webhook", async (req, res) => {
         logSignal(rawText.substring(0, 1000), payload, "hedge_pe_failed");
         return res.json({ status: "error", message: "PE hedge order failed. No futures placed — no naked position." });
       }
-      // Wait 1 second for exchange to register the hedge
-      await new Promise(r => setTimeout(r, 1000));
+      // Wait 1.5 seconds for exchange to register the hedge position
+      await new Promise(r => setTimeout(r, 1500));
       console.log("[HEDGE] Step 2: Placing futures order (with hedge margin benefit)...");
       const futOrder = await placeUpstoxOrder(token, { quantity: futQty, product: legProduct, validity: "DAY", order_type: "MARKET", transaction_type: "BUY", instrument_token: futResult.instrument_key, tag: "hedge_fut" });
       console.log(`[HEDGE] Fut order: ${futOrder.ok ? "OK" : "FAILED"}`);
@@ -844,7 +874,7 @@ app.post("/webhook", async (req, res) => {
         console.log(`[HEDGE] PE reversal: ${reversePe.ok ? "OK" : "FAILED"}`);
         if (!reversePe.ok) addLog("ERROR", `CRITICAL: PE reversal failed — manual exit needed for ${peContract.instrument_key}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_fut_failed");
-        return res.json({ status: "error", message: "Futures order failed (even with hedge). PE reversed. Check funds — futures need more margin than options." });
+        return res.json({ status: "error", message: "Futures order failed. PE reversed. Check funds." });
       }
 
       // Track futures position
@@ -936,7 +966,21 @@ app.post("/webhook", async (req, res) => {
         { instrument_key: ceContract.instrument_key, quantity: optQty, transaction_type: "BUY", product: legProduct }
       ]);
 
-      // Place OPTION FIRST (hedge), then FUTURES — so exchange gives margin benefit
+      // Pre-check funds
+      const funds = await getAvailableFunds(token);
+      if (funds && marginInfo && marginInfo.final_margin > funds.available_margin) {
+        const shortfall = Math.ceil(marginInfo.final_margin - funds.available_margin);
+        console.log(`[HEDGE] INSUFFICIENT FUNDS: need ${marginInfo.final_margin}, have ${funds.available_margin}`);
+        logSignal(rawText.substring(0, 1000), payload, "hedge_insufficient_funds");
+        addLog("ERROR", `Hedge rejected: need ${marginInfo.final_margin}, have ${funds.available_margin}. Add ${shortfall}.`);
+        return res.json({ status: "error", message: `Insufficient funds. Need ${marginInfo.final_margin} margin (after hedge), have ${funds.available_margin}. Add ${shortfall}.` });
+      }
+      if (marginInfo) {
+        console.log(`[HEDGE] Margin: required=${marginInfo.required_margin}, final=${marginInfo.final_margin} (benefit: ${marginInfo.benefit})`);
+        addLog("INFO", `Hedge margin: required ${marginInfo.required_margin}, after benefit ${marginInfo.final_margin} (save ${Math.round(marginInfo.benefit)})`);
+      }
+
+      // Place CE (hedge) FIRST, then futures
       console.log("[HEDGE] Step 1: Placing CE (hedge) order first...");
       const ceOrder = await placeUpstoxOrder(token, { quantity: optQty, product: legProduct, validity: "DAY", order_type: "MARKET", transaction_type: "BUY", instrument_token: ceContract.instrument_key, tag: "hedge_ce" });
       console.log(`[HEDGE] CE order: ${ceOrder.ok ? "OK" : "FAILED"}`);
@@ -944,8 +988,7 @@ app.post("/webhook", async (req, res) => {
         logSignal(rawText.substring(0, 1000), payload, "hedge_ce_failed");
         return res.json({ status: "error", message: "CE hedge order failed. No futures placed — no naked position." });
       }
-      // Wait 1 second for exchange to register the hedge
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, 1500));
       console.log("[HEDGE] Step 2: Placing futures order (with hedge margin benefit)...");
       const futOrder = await placeUpstoxOrder(token, { quantity: futQty, product: legProduct, validity: "DAY", order_type: "MARKET", transaction_type: "SELL", instrument_token: futResult.instrument_key, tag: "hedge_fut" });
       console.log(`[HEDGE] Fut order: ${futOrder.ok ? "OK" : "FAILED"}`);
@@ -954,7 +997,7 @@ app.post("/webhook", async (req, res) => {
         const reverseCe = await placeExitOrder(token, ceContract.instrument_key, optQty, "SELL", legProduct);
         if (!reverseCe.ok) addLog("ERROR", `CRITICAL: CE reversal failed — manual exit needed for ${ceContract.instrument_key}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_fut_failed");
-        return res.json({ status: "error", message: "Futures order failed (even with hedge). CE reversed. Check funds — futures need more margin than options." });
+        return res.json({ status: "error", message: "Futures order failed. CE reversed. Check funds." });
       }
 
       db.prepare("INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active, hedge_id, leg_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")

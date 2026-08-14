@@ -1389,6 +1389,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   <div class="tab" onclick="showTab('orders',this)">Orders</div>
   <div class="tab" onclick="showTab('positions',this)">Positions</div>
   
+  <div class="tab" onclick="showTab('futures',this)">📊 Futures Hedge</div>
   <div class="tab" onclick="showTab('settings',this)">⚙️ Settings</div>
 </div>
 
@@ -1481,27 +1482,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 
 
   </div>
-  <div class="section-divider"></div>
-  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Hedge Option Strike Offset</h2>
-  <div class="form-row" style="align-items:center;">
-    <div style="flex:1;">
-      <label>Option Strike (for futures hedge)</label>
-      <select id="tcStrikeOffset">
-        <option value="1">1 strike from ATM (costliest, max protection)</option>
-        <option value="2" selected>2 strikes from ATM</option>
-        <option value="3">3 strikes from ATM</option>
-        <option value="4">4 strikes from ATM</option>
-        <option value="5">5 strikes from ATM</option>
-        <option value="6">6 strikes from ATM (cheapest, min protection)</option>
-        <option value="8">8 strikes from ATM</option>
-        <option value="10">10 strikes from ATM</option>
-      </select>
-    </div>
-    <div style="margin-left:12px;font-size:0.75rem;color:#8b949e;max-width:200px;">
-      Lower = more protection but costlier option. Higher = cheaper option, less protection.
-    </div>
-  </div>
-  <div class="section-divider"></div>
+
   <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">TradingView Webhook Setup</h2>
   <p class="muted" style="margin-bottom:6px;">Webhook URL:</p>
   <div class="json-box" id="tcWebhookUrl" style="font-size:0.75rem;"></div>
@@ -1576,6 +1557,50 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 
 
 
+<div id="tab-futures" class="card hidden">
+  <h2>📊 NIFTY 50 Futures Hedge</h2>
+  <p class="muted" style="margin-bottom:12px;">Configure futures + option hedge strategy. Option is bought only for margin benefit — profit comes from futures.</p>
+  
+  <div style="background:var(--surface);border:1px solid var(--blue);border-radius:8px;padding:12px;margin-bottom:16px;">
+    <h3 style="color:var(--blue);margin-bottom:8px;font-size:0.95rem;">How it works</h3>
+    <p style="font-size:0.8rem;color:#8b949e;margin-bottom:4px;">🟢 <b>buy_future_hedge</b> → BUY futures + BUY OTM PE (bullish, PE = protection)</p>
+    <p style="font-size:0.8rem;color:#8b949e;margin-bottom:4px;">🔴 <b>sell_future_hedge</b> → SELL futures + BUY OTM CE (bearish, CE = protection)</p>
+    <p style="font-size:0.8rem;color:#8b949e;margin-bottom:4px;">❌ <b>exit_future_hedge</b> → Close BOTH legs simultaneously (avoids margin penalty)</p>
+  </div>
+
+  <div class="section-divider"></div>
+  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Option Strike Selection</h2>
+  <div class="form-row" style="align-items:center;margin-bottom:12px;">
+    <div style="flex:1;">
+      <label>Strike distance from ATM (for protective option)</label>
+      <select id="tcStrikeOffset" style="font-size:1rem;padding:8px;">
+        <option value="1">1 strike from ATM — costliest option, max protection</option>
+        <option value="2" selected>2 strikes from ATM</option>
+        <option value="3">3 strikes from ATM</option>
+        <option value="4">4 strikes from ATM</option>
+        <option value="5">5 strikes from ATM</option>
+        <option value="6">6 strikes from ATM — cheapest, min protection</option>
+        <option value="8">8 strikes from ATM</option>
+        <option value="10">10 strikes from ATM</option>
+      </select>
+    </div>
+  </div>
+  <p class="muted" style="font-size:0.75rem;margin-bottom:12px;">NIFTY strike interval = 50pts. Offset 3 = 150pts away from ATM.<br>Lower offset = more protection but costlier option. Higher offset = cheaper option, less protection.<br>You can also override per-signal: <code>{"action":"buy_future_hedge","strike_offset":4}</code></p>
+
+  <div class="section-divider"></div>
+  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Webhook Alert Messages</h2>
+  <div class="json-box" style="font-size:0.75rem;">{"action":"buy_future_hedge"} &nbsp; — bullish: BUY futures + BUY PE<br>{"action":"sell_future_hedge"} &nbsp; — bearish: SELL futures + BUY CE<br>{"action":"exit_future_hedge"} &nbsp; — close both legs simultaneously<br><br>With custom strike offset:<br>{"action":"buy_future_hedge","strike_offset":4}<br>{"action":"sell_future_hedge","strike_offset":3}</div>
+  
+  <div class="section-divider"></div>
+  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Strike Calculation Example</h2>
+  <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:0.8rem;">
+    <p style="margin-bottom:6px;"><b>If NIFTY spot = 24,350 and offset = 3:</b></p>
+    <p style="margin-bottom:4px;color:var(--green);">BUY_FUTURE_HEDGE → PE strike = 24,350 - (3×50) = <b>24,200</b></p>
+    <p style="margin-bottom:4px;color:var(--red);">SELL_FUTURE_HEDGE → CE strike = 24,350 + (3×50) = <b>24,500</b></p>
+    <p style="color:#8b949e;font-size:0.7rem;margin-top:8px;">Bot selects nearest expiry futures contract + OTM option automatically.</p>
+  </div>
+</div>
+
 <div id="tab-settings" class="card hidden">
   <h2>⚙️ Settings</h2>
   <p class="muted" style="margin-bottom:12px;">Configure Upstox API credentials and webhook secret.</p>
@@ -1606,7 +1631,7 @@ document.addEventListener('DOMContentLoaded',function(){document.title=document.
 const api=async(p,o)=>{try{const r=await fetch(p,o);if(!r.ok){console.error('API error:',r.status,p);return{error:'HTTP '+r.status};}return await r.json();}catch(e){console.error('API fetch error:',e.message,p);return{error:e.message};}};
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',3500);}
 function fmtTime(ts){return ts?new Date(ts).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:false}):'—';}
-let _activeTab='';function showTab(n,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');document.querySelectorAll('[id^="tab-"]').forEach(d=>d.classList.add('hidden'));document.getElementById('tab-'+n).classList.remove('hidden');_activeTab=n;if(n==='signals')loadSignals();if(n==='orders')loadOrders();if(n==='positions')loadPositions();if(n==='settings')loadSettings();if(n==='auto')loadTradingConfig();if(n==='strategy')loadStratConfig();if(n==='backtest')loadBacktestStrats();}
+let _activeTab='';function showTab(n,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');document.querySelectorAll('[id^="tab-"]').forEach(d=>d.classList.add('hidden'));document.getElementById('tab-'+n).classList.remove('hidden');_activeTab=n;if(n==='signals')loadSignals();if(n==='orders')loadOrders();if(n==='positions')loadPositions();if(n==='settings')loadSettings();if(n==='futures')loadTradingConfig();if(n==='auto')loadTradingConfig();if(n==='strategy')loadStratConfig();if(n==='backtest')loadBacktestStrats();}
 let obState={instrumentKey:null,lotSize:1,instrumentToken:null};
 async function loadStatus(){try{const s=await api('/api/token-status');if(!s||s.error){document.getElementById('tokenText').textContent='Error';return;}const d=document.getElementById('tokenDot'),t=document.getElementById('tokenText');if(!s.has_token){d.className='dot red';t.textContent='No token';}else if(s.is_expired){d.className='dot red';t.textContent='EXPIRED';}else{d.className='dot green';t.textContent='Valid until '+fmtTime(s.expires_at);}document.getElementById('killToggle').checked=s.kill_switch;document.getElementById('killText').textContent=s.kill_switch?'OFF':'ON';document.getElementById('killBanner').classList.toggle('hidden',!s.kill_switch);api('/health').then(h=>{if(h&&!h.error)document.getElementById('marketStatus').textContent=h.market_open?'OPEN':'CLOSED';});}catch(e){console.error('loadStatus error:',e);}}
 async function requestToken(){document.getElementById('tokenBtn').disabled=true;try{const r=await api('/api/request-token',{method:'POST'});if(r.ok){toast('✅ Token request sent — approve on Upstox app');}else{const msg=(r.data&&(r.data.message||r.data.error||JSON.stringify(r.data)))||'HTTP '+r.status;toast('❌ Failed: '+msg);}}catch(e){toast('❌ Network error: '+e.message);}document.getElementById('tokenBtn').disabled=false;setTimeout(loadStatus,3000);}

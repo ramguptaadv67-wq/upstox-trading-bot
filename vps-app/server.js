@@ -193,7 +193,8 @@ const DEFAULT_TRADING_CONFIG = {
   underlying: "NSE_INDEX|Nifty 50",
   underlying_name: "NIFTY 50",
   lot_size: 65,
-  option_type: "CE",                // CE or PE (default leg)
+  option_type: "CE",
+  strike_offset: 2,                // CE or PE (default leg)
   lots: 1,
   product: "D",
   // --- CE leg (Buy CE alerts) ---
@@ -796,7 +797,7 @@ app.post("/webhook", async (req, res) => {
     const hedgeOptionType = action === "BUY_FUTURE_HEDGE" ? "PE" : "CE";
     const hedgeId = `HEDGE_${Date.now()}`;
     // strike_offset: how far OTM (default 2 = 2 strikes away = cheaper option)
-    const strikeOffset = parseInt(payload.strike_offset ?? 2, 10);
+    const strikeOffset = parseInt(payload.strike_offset ?? tcfg.strike_offset ?? 2, 10);
     console.log(`[HEDGE] Starting ${action}: Fut=${futDirection}, Option=BUY ${hedgeOptionType} (OTM offset=${strikeOffset}), hedge_id=${hedgeId}`);
 
     // Step 1: Find futures contract + spot price in parallel
@@ -1450,6 +1451,27 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
         <label class="toggle"><input type="checkbox" id="tcPeEnabled" checked><span class="slider"></span></label>
         <span style="margin-left:8px;font-weight:600;">Enable PE leg</span>
       </div>
+  <div class="section-divider"></div>
+  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Hedge Option Strike Offset</h2>
+  <div class="form-row" style="align-items:center;">
+    <div style="flex:1;">
+      <label>Option Strike (for futures hedge)</label>
+      <select id="tcStrikeOffset">
+        <option value="1">1 strike from ATM (costliest option, max protection)</option>
+        <option value="2" selected>2 strikes from ATM</option>
+        <option value="3">3 strikes from ATM</option>
+        <option value="4">4 strikes from ATM</option>
+        <option value="5">5 strikes from ATM</option>
+        <option value="6">6 strikes from ATM (cheapest, min protection)</option>
+        <option value="8">8 strikes from ATM</option>
+        <option value="10">10 strikes from ATM</option>
+      </select>
+    </div>
+    <div style="margin-left:12px;font-size:0.75rem;color:#8b949e;max-width:200px;">
+      Lower = more protection but costlier option. Higher = cheaper option, less protection.
+    </div>
+  </div>
+
       <div><label>Lots</label><input id="tcPeLots" type="number" value="1" min="1"></div>
       <div style="margin-top:6px;"><label>Product</label><select id="tcPeProduct"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
       
@@ -1568,9 +1590,9 @@ async function toggleKillSwitch(){const isOn=document.getElementById('killToggle
 async function loadInstruments(){try{const r=await api('/api/instruments');if(!r||r.error){console.error('loadInstruments error');return;}const ob=document.getElementById('obInstrument');if(ob){ob.innerHTML='<option value="">— Select —</option>';r.instruments.forEach(i=>ob.innerHTML+='<option value="'+i.key+'" data-lot="'+i.lot_size+'">'+i.name+' (lot: '+i.lot_size+')</option>');}const tc=document.getElementById('tcUnderlying');if(tc){tc.innerHTML='';r.instruments.forEach(i=>tc.innerHTML+='<option value="'+i.key+'" data-lot="'+i.lot_size+'">'+i.name+' (lot: '+i.lot_size+')</option>');}}catch(e){console.error('loadInstruments error:',e);}}
 function onTcInstrumentChange(){const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value)return;const lot=parseInt(o.dataset.lot||'1',10);const ls=document.getElementById('tcLotSize');if(ls)ls.value=lot;updateTcQty(lot);}
 function updateTcQty(lot){const ls=document.getElementById('tcLotSize');if(!lot)lot=parseInt(ls&&ls.value||'65',10);const ceLots=parseInt(document.getElementById('tcCeLots').value||'1',10);const peLots=parseInt(document.getElementById('tcPeLots').value||'1',10);const ceq=document.getElementById('tcCeQty');const peq=document.getElementById('tcPeQty');if(ceq)ceq.value=ceLots*lot;if(peq)peq.value=peLots*lot;}
-async function loadTradingConfig(){try{const c=await api('/api/trading-config');if(!c||c.error){console.error('loadTradingConfig error');return;}const s=document.getElementById('tcUnderlying');if(s&&c.underlying){for(let i=0;i<s.options.length;i++){if(s.options[i].value===c.underlying){s.selectedIndex=i;break;}}onTcInstrumentChange();}document.getElementById('tcCeEnabled').checked=c.ce_enabled!==false;document.getElementById('tcCeLots').value=c.ce_lots||c.lots||1;document.getElementById('tcCeProduct').value=c.ce_product||c.product||'D';document.getElementById('tcPeEnabled').checked=c.pe_enabled!==false;document.getElementById('tcPeLots').value=c.pe_lots||c.lots||1;document.getElementById('tcPeProduct').value=c.pe_product||c.product||'D';const wu=await api('/api/webhook-url');document.getElementById('tcWebhookUrl').textContent=wu.url||'Set WEBHOOK_SECRET in Settings first';document.getElementById('tcStatus').innerHTML='Config loaded';if(c.lot_size)document.getElementById('tcLotSize').value=c.lot_size;updateTcQty(c.lot_size||65);}catch(e){console.error('loadTradingConfig error:',e);}}
+async function loadTradingConfig(){try{const c=await api('/api/trading-config');if(!c||c.error){console.error('loadTradingConfig error');return;}const s=document.getElementById('tcUnderlying');if(s&&c.underlying){for(let i=0;i<s.options.length;i++){if(s.options[i].value===c.underlying){s.selectedIndex=i;break;}}onTcInstrumentChange();}document.getElementById('tcCeEnabled').checked=c.ce_enabled!==false;document.getElementById('tcCeLots').value=c.ce_lots||c.lots||1;document.getElementById('tcCeProduct').value=c.ce_product||c.product||'D';document.getElementById('tcPeEnabled').checked=c.pe_enabled!==false;document.getElementById('tcPeLots').value=c.pe_lots||c.lots||1;document.getElementById('tcPeProduct').value=c.pe_product||c.product||'D';const so=document.getElementById('tcStrikeOffset');if(so)so.value=c.strike_offset||2;const wu=await api('/api/webhook-url');document.getElementById('tcWebhookUrl').textContent=wu.url||'Set WEBHOOK_SECRET in Settings first';document.getElementById('tcStatus').innerHTML='Config loaded';if(c.lot_size)document.getElementById('tcLotSize').value=c.lot_size;updateTcQty(c.lot_size||65);}catch(e){console.error('loadTradingConfig error:',e);}}
 function getSetting_webhook_secret_hint(){return '';}
-async function saveTradingConfig(){try{const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value){toast('Select underlying');return;}const lot=parseInt(document.getElementById('tcLotSize').value||o.dataset.lot||'65',10);const b={underlying:o.value,underlying_name:o.text.split(' (')[0],lot_size:lot,option_type:'CE',lots:parseInt(document.getElementById('tcCeLots').value||'1',10),product:document.getElementById('tcCeProduct').value,ce_enabled:document.getElementById('tcCeEnabled').checked,ce_lots:parseInt(document.getElementById('tcCeLots').value||'1',10),ce_product:document.getElementById('tcCeProduct').value,pe_enabled:document.getElementById('tcPeEnabled').checked,pe_lots:parseInt(document.getElementById('tcPeLots').value||'1',10),pe_product:document.getElementById('tcPeProduct').value};const r=await api('/api/trading-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});if(r&&r.error){toast('❌ Save failed: '+r.error);return;}toast('✅ Trading config saved!');console.log('[CONFIG] Save response:',JSON.stringify(r));}catch(e){toast('❌ Error: '+e.message);}}
+async function saveTradingConfig(){try{const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value){toast('Select underlying');return;}const lot=parseInt(document.getElementById('tcLotSize').value||o.dataset.lot||'65',10);const b={underlying:o.value,underlying_name:o.text.split(' (')[0],lot_size:lot,option_type:'CE',lots:parseInt(document.getElementById('tcCeLots').value||'1',10),product:document.getElementById('tcCeProduct').value,ce_enabled:document.getElementById('tcCeEnabled').checked,ce_lots:parseInt(document.getElementById('tcCeLots').value||'1',10),ce_product:document.getElementById('tcCeProduct').value,pe_enabled:document.getElementById('tcPeEnabled').checked,pe_lots:parseInt(document.getElementById('tcPeLots').value||'1',10),pe_product:document.getElementById('tcPeProduct').value,strike_offset:parseInt(document.getElementById('tcStrikeOffset').value||'2',10)};const r=await api('/api/trading-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});if(r&&r.error){toast('❌ Save failed: '+r.error);return;}toast('✅ Trading config saved!');console.log('[CONFIG] Save response:',JSON.stringify(r));}catch(e){toast('❌ Error: '+e.message);}}
 function copyTcWebhookUrl(){const u=document.getElementById('tcWebhookUrl').textContent;navigator.clipboard.writeText(u).then(()=>toast('✅ Webhook URL copied!'));}
 let _strategies = {};
 let _stratParams = {};

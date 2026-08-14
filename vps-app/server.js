@@ -1466,6 +1466,9 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 .toggle .slider:before{content:"";position:absolute;height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
 .toggle input:checked+.slider{background:var(--green)}
 .toggle input:checked+.slider:before{transform:translateX(20px)}
+.tlight{display:inline-block;width:10px;height:10px;border-radius:50%;margin-left:6px;vertical-align:middle;transition:background .2s,box-shadow .2s}
+.tlight.on{background:#22c55e;box-shadow:0 0 6px #22c55e}
+.tlight.off{background:#ef4444;box-shadow:0 0 6px #ef4444}
 .tab-row{display:flex;gap:4px;margin-bottom:12px;flex-wrap:wrap}
 .tab{padding:6px 14px;border-radius:6px 6px 0 0;cursor:pointer;font-size:0.85rem;border:1px solid var(--border);background:var(--surface)}
 .tab.active{background:var(--blue);color:#fff;border-color:var(--blue)}
@@ -1512,7 +1515,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
     <button class="btn btn-primary" onclick="requestToken()" id="tokenBtn">Request New Token</button>
   </div>
   <div class="card"><h2>On / Off</h2>
-    <div class="status-row"><label class="toggle"><input type="checkbox" id="killToggle" onchange="toggleKillSwitch()"><span class="slider"></span></label><span id="killText" style="margin-left:8px;">OFF</span></div>
+    <div class="status-row"><label class="toggle"><input type="checkbox" id="killToggle" onchange="toggleKillSwitch()"><span class="slider"></span></label><span id="killText" style="margin-left:8px;">OFF</span><span class="tlight off" id="killLight"></span></div>
     <p class="muted">When ON, all signals are rejected.</p>
   </div>
 </div>
@@ -1585,7 +1588,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 <div id="tab-auto" class="card">
   <h2>🤖 Auto Trade Config</h2>
   <div class="form-row" style="align-items:center;margin-bottom:12px;">
-    <label class="toggle"><input type="checkbox" id="tcAutoEnabled" checked onchange="saveTradingConfig()"><span class="slider"></span></label>
+    <label class="toggle"><input type="checkbox" id="tcAutoEnabled" checked onchange="saveTradingConfig()"><span class="slider"></span></label><span class="tlight on" id="autoLight"></span>
     <span style="margin-left:8px;font-weight:600;">Auto Trade (Option Only)</span>
     <span class="muted" style="margin-left:8px;font-size:0.75rem;">ON = buy_ce/buy_pe buy options. OFF = signals ignored.</span>
   </div>
@@ -1601,7 +1604,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
     <div style="background:var(--bg);border:1px solid var(--green);border-radius:8px;padding:12px;">
       <h3 style="color:var(--green);margin-bottom:8px;font-size:0.95rem;">🟢 CE Leg (Buy CE alerts)</h3>
       <div class="form-row" style="align-items:center;margin-bottom:8px;">
-        <label class="toggle"><input type="checkbox" id="tcCeEnabled" checked><span class="slider"></span></label>
+        <label class="toggle"><input type="checkbox" id="tcCeEnabled" checked onchange="updateLights()"><span class="slider"></span></label><span class="tlight on" id="ceLight"></span>
         <span style="margin-left:8px;font-weight:600;">Enable CE leg</span>
       </div>
       <div><label>Lots</label><input id="tcCeLots" type="number" value="1" min="1"></div>
@@ -1611,7 +1614,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
     <div style="background:var(--bg);border:1px solid var(--red);border-radius:8px;padding:12px;">
       <h3 style="color:var(--red);margin-bottom:8px;font-size:0.95rem;">🔴 PE Leg (Buy PE alerts)</h3>
       <div class="form-row" style="align-items:center;margin-bottom:8px;">
-        <label class="toggle"><input type="checkbox" id="tcPeEnabled" checked><span class="slider"></span></label>
+        <label class="toggle"><input type="checkbox" id="tcPeEnabled" checked onchange="updateLights()"><span class="slider"></span></label><span class="tlight on" id="peLight"></span>
         <span style="margin-left:8px;font-weight:600;">Enable PE leg</span>
       </div>
   
@@ -1658,7 +1661,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
     <span class="muted" style="font-size:0.75rem;margin-left:8px;" id="stratLogCount">0 signals</span>
   </div>
   <div class="form-row" style="align-items:center;">
-    <label class="toggle"><input type="checkbox" id="stratEnabled" onchange="toggleStratEngine()"><span class="slider"></span></label>
+    <label class="toggle"><input type="checkbox" id="stratEnabled" onchange="toggleStratEngine()"><span class="slider"></span></label><span class="tlight off" id="stratLight"></span>
     <span style="margin-left:8px;font-weight:600;">Enable Strategy Engine</span>
     <button class="btn btn-secondary" onclick="loadStratConfig()" style="margin-left:auto;">Refresh</button>
     <button class="btn btn-primary" onclick="saveStratConfig()">💾 Save Config</button>
@@ -1701,7 +1704,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 <div id="tab-futures" class="card hidden">
   <h2>📊 NIFTY 50 Futures Hedge</h2>
   <div class="form-row" style="align-items:center;margin-bottom:12px;">
-    <label class="toggle"><input type="checkbox" id="tcFuturesEnabled" onchange="saveTradingConfig()"><span class="slider"></span></label>
+    <label class="toggle"><input type="checkbox" id="tcFuturesEnabled" onchange="saveTradingConfig()"><span class="slider"></span></label><span class="tlight off" id="futuresLight"></span>
     <span style="margin-left:8px;font-weight:600;">Futures Hedge Mode</span>
     <span class="muted" style="margin-left:8px;font-size:0.75rem;">ON = buy_ce/buy_pe trade futures+option hedge. OFF = uses Auto Trade instead.</span>
   </div>
@@ -1799,17 +1802,18 @@ function toast(m){const t=document.getElementById('toast');t.textContent=m;t.sty
 function fmtTime(ts){return ts?new Date(ts).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour12:false}):'—';}
 let _activeTab='';function showTab(n,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');document.querySelectorAll('[id^="tab-"]').forEach(d=>d.classList.add('hidden'));document.getElementById('tab-'+n).classList.remove('hidden');_activeTab=n;if(n==='signals')loadSignals();if(n==='orders')loadOrders();if(n==='positions')loadPositions();if(n==='settings')loadSettings();if(n==='futures')loadTradingConfig();if(n==='auto')loadTradingConfig();if(n==='strategy')loadStratConfig();if(n==='backtest')loadBacktestStrats();}
 let obState={instrumentKey:null,lotSize:1,instrumentToken:null};
-async function loadStatus(){try{const s=await api('/api/token-status');if(!s||s.error){document.getElementById('tokenText').textContent='Error';return;}const d=document.getElementById('tokenDot'),t=document.getElementById('tokenText');if(!s.has_token){d.className='dot red';t.textContent='No token';}else if(s.is_expired){d.className='dot red';t.textContent='EXPIRED';}else{d.className='dot green';t.textContent='Valid until '+fmtTime(s.expires_at);}document.getElementById('killToggle').checked=s.kill_switch;document.getElementById('killText').textContent=s.kill_switch?'OFF':'ON';document.getElementById('killBanner').classList.toggle('hidden',!s.kill_switch);api('/health').then(h=>{if(h&&!h.error)document.getElementById('marketStatus').textContent=h.market_open?'OPEN':'CLOSED';});}catch(e){console.error('loadStatus error:',e);}}
+function updateLights(){const m=[['killToggle','killLight'],['tcAutoEnabled','autoLight'],['tcCeEnabled','ceLight'],['tcPeEnabled','peLight'],['stratEnabled','stratLight'],['tcFuturesEnabled','futuresLight']];m.forEach(function(p){var cb=document.getElementById(p[0]),lt=document.getElementById(p[1]);if(cb&&lt)lt.className='tlight '+(cb.checked?'on':'off');});}
+async function loadStatus(){try{const s=await api('/api/token-status');if(!s||s.error){document.getElementById('tokenText').textContent='Error';return;}const d=document.getElementById('tokenDot'),t=document.getElementById('tokenText');if(!s.has_token){d.className='dot red';t.textContent='No token';}else if(s.is_expired){d.className='dot red';t.textContent='EXPIRED';}else{d.className='dot green';t.textContent='Valid until '+fmtTime(s.expires_at);}document.getElementById('killToggle').checked=s.kill_switch;document.getElementById('killText').textContent=s.kill_switch?'OFF':'ON';document.getElementById('killBanner').classList.toggle('hidden',!s.kill_switch);updateLights();api('/health').then(h=>{if(h&&!h.error)document.getElementById('marketStatus').textContent=h.market_open?'OPEN':'CLOSED';});}catch(e){console.error('loadStatus error:',e);}}
 async function requestToken(){document.getElementById('tokenBtn').disabled=true;try{const r=await api('/api/request-token',{method:'POST'});if(r.ok){toast('✅ Token request sent — approve on Upstox app');}else{const msg=(r.data&&(r.data.message||r.data.error||JSON.stringify(r.data)))||'HTTP '+r.status;toast('❌ Failed: '+msg);}}catch(e){toast('❌ Network error: '+e.message);}document.getElementById('tokenBtn').disabled=false;setTimeout(loadStatus,3000);}
-async function toggleKillSwitch(){const isOn=document.getElementById('killToggle').checked;try{await api('/api/kill-switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:isOn?'on':'off'})});document.getElementById('killText').textContent=isOn?'OFF':'ON';document.getElementById('killBanner').classList.toggle('hidden',!isOn);toast(isOn?'⚠ Bot OFF — signals blocked':'✅ Bot ON — signals active');}catch(e){toast('❌ Error: '+e.message);}}
+async function toggleKillSwitch(){const isOn=document.getElementById('killToggle').checked;try{await api('/api/kill-switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:isOn?'on':'off'})});document.getElementById('killText').textContent=isOn?'OFF':'ON';updateLights();document.getElementById('killBanner').classList.toggle('hidden',!isOn);toast(isOn?'⚠ Bot OFF — signals blocked':'✅ Bot ON — signals active');}catch(e){toast('❌ Error: '+e.message);}}
 async function loadInstruments(){try{const r=await api('/api/instruments');if(!r||r.error){console.error('loadInstruments error');return;}const ob=document.getElementById('obInstrument');if(ob){ob.innerHTML='<option value="">— Select —</option>';r.instruments.forEach(i=>ob.innerHTML+='<option value="'+i.key+'" data-lot="'+i.lot_size+'">'+i.name+' (lot: '+i.lot_size+')</option>');}const tc=document.getElementById('tcUnderlying');if(tc){tc.innerHTML='';r.instruments.forEach(i=>tc.innerHTML+='<option value="'+i.key+'" data-lot="'+i.lot_size+'">'+i.name+' (lot: '+i.lot_size+')</option>');}}catch(e){console.error('loadInstruments error:',e);}}
 function onTcInstrumentChange(){const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value)return;const lot=parseInt(o.dataset.lot||'1',10);const ls=document.getElementById('tcLotSize');if(ls)ls.value=lot;updateTcQty(lot);}
 function updateTcQty(lot){const ls=document.getElementById('tcLotSize');if(!lot)lot=parseInt(ls&&ls.value||'65',10);const ceLots=parseInt(document.getElementById('tcCeLots').value||'1',10);const peLots=parseInt(document.getElementById('tcPeLots').value||'1',10);const ceq=document.getElementById('tcCeQty');const peq=document.getElementById('tcPeQty');if(ceq)ceq.value=ceLots*lot;if(peq)peq.value=peLots*lot;}
 async function loadTradingConfig(){try{const c=await api('/api/trading-config');if(!c||c.error){console.error('loadTradingConfig error');return;}const s=document.getElementById('tcUnderlying');if(s&&c.underlying){for(let i=0;i<s.options.length;i++){if(s.options[i].value===c.underlying){s.selectedIndex=i;break;}}onTcInstrumentChange();}document.getElementById('tcCeEnabled').checked=c.ce_enabled!==false;document.getElementById('tcCeLots').value=c.ce_lots||c.lots||1;document.getElementById('tcCeProduct').value=c.ce_product||c.product||'D';document.getElementById('tcPeEnabled').checked=c.pe_enabled!==false;document.getElementById('tcPeLots').value=c.pe_lots||c.lots||1;document.getElementById('tcPeProduct').value=c.pe_product||c.product||'D';const so=document.getElementById('tcStrikeOffset');if(so)so.value=c.strike_offset||2;const hl=document.getElementById('tcHedgeLots');if(hl)hl.value=c.hedge_lots||1;
 const ae=document.getElementById('tcAutoEnabled');if(ae)ae.checked=c.auto_enabled!==false;
-const fe=document.getElementById('tcFuturesEnabled');if(fe)fe.checked=c.futures_enabled||false;const wu=await api('/api/webhook-url');document.getElementById('tcWebhookUrl').textContent=wu.url||'Set WEBHOOK_SECRET in Settings first';document.getElementById('tcStatus').innerHTML='Config loaded';if(c.lot_size)document.getElementById('tcLotSize').value=c.lot_size;updateTcQty(c.lot_size||65);}catch(e){console.error('loadTradingConfig error:',e);}}
+const fe=document.getElementById('tcFuturesEnabled');if(fe)fe.checked=c.futures_enabled||false;updateLights();const wu=await api('/api/webhook-url');document.getElementById('tcWebhookUrl').textContent=wu.url||'Set WEBHOOK_SECRET in Settings first';document.getElementById('tcStatus').innerHTML='Config loaded';if(c.lot_size)document.getElementById('tcLotSize').value=c.lot_size;updateTcQty(c.lot_size||65);}catch(e){console.error('loadTradingConfig error:',e);}}
 function getSetting_webhook_secret_hint(){return '';}
-async function saveTradingConfig(){try{const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value){toast('Select underlying');return;}const lot=parseInt(document.getElementById('tcLotSize').value||o.dataset.lot||'65',10);const b={underlying:o.value,underlying_name:o.text.split(' (')[0],lot_size:lot,option_type:'CE',lots:parseInt(document.getElementById('tcCeLots').value||'1',10),product:document.getElementById('tcCeProduct').value,ce_enabled:document.getElementById('tcCeEnabled').checked,ce_lots:parseInt(document.getElementById('tcCeLots').value||'1',10),ce_product:document.getElementById('tcCeProduct').value,pe_enabled:document.getElementById('tcPeEnabled').checked,pe_lots:parseInt(document.getElementById('tcPeLots').value||'1',10),pe_product:document.getElementById('tcPeProduct').value,strike_offset:parseInt(document.getElementById('tcStrikeOffset')?.value||'2',10),hedge_lots:parseInt(document.getElementById('tcHedgeLots')?.value||'1',10),auto_enabled:document.getElementById('tcAutoEnabled')?.checked!==false,futures_enabled:document.getElementById('tcFuturesEnabled')?.checked||false};const r=await api('/api/trading-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});if(r&&r.error){toast('❌ Save failed: '+r.error);return;}toast('✅ Trading config saved!');console.log('[CONFIG] Save response:',JSON.stringify(r));}catch(e){toast('❌ Error: '+e.message);}}
+async function saveTradingConfig(){try{const s=document.getElementById('tcUnderlying');const o=s.options[s.selectedIndex];if(!o||!o.value){toast('Select underlying');return;}const lot=parseInt(document.getElementById('tcLotSize').value||o.dataset.lot||'65',10);const b={underlying:o.value,underlying_name:o.text.split(' (')[0],lot_size:lot,option_type:'CE',lots:parseInt(document.getElementById('tcCeLots').value||'1',10),product:document.getElementById('tcCeProduct').value,ce_enabled:document.getElementById('tcCeEnabled').checked,ce_lots:parseInt(document.getElementById('tcCeLots').value||'1',10),ce_product:document.getElementById('tcCeProduct').value,pe_enabled:document.getElementById('tcPeEnabled').checked,pe_lots:parseInt(document.getElementById('tcPeLots').value||'1',10),pe_product:document.getElementById('tcPeProduct').value,strike_offset:parseInt(document.getElementById('tcStrikeOffset')?.value||'2',10),hedge_lots:parseInt(document.getElementById('tcHedgeLots')?.value||'1',10),auto_enabled:document.getElementById('tcAutoEnabled')?.checked!==false,futures_enabled:document.getElementById('tcFuturesEnabled')?.checked||false};const r=await api('/api/trading-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});if(r&&r.error){toast('❌ Save failed: '+r.error);return;}toast('✅ Trading config saved!');updateLights();console.log('[CONFIG] Save response:',JSON.stringify(r));}catch(e){toast('❌ Error: '+e.message);}}
 function copyTcWebhookUrl(){const u=document.getElementById('tcWebhookUrl').textContent;navigator.clipboard.writeText(u).then(()=>toast('✅ Webhook URL copied!'));}
 let _strategies = {};
 let _stratParams = {};
@@ -1920,7 +1924,7 @@ async function toggleStratEngine(){
   const isOn = document.getElementById('stratEnabled').checked;
   if (isOn) await saveStratConfig();
   await api('/api/strategy-toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:isOn?'start':'stop'})});
-  toast(isOn?'📈 Engine started':'⏹ Engine stopped');
+  toast(isOn?'📈 Engine started':'⏹ Engine stopped');updateLights();
   setTimeout(loadStratConfig,1000);
 }
 

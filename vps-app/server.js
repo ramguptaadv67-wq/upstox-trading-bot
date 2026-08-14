@@ -79,9 +79,11 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
   CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, raw_message TEXT, payload TEXT, status TEXT);
   CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, type TEXT, action TEXT, instrument_token TEXT, quantity INTEGER, result TEXT, ok INTEGER);
-  CREATE TABLE IF NOT EXISTS positions (id INTEGER PRIMARY KEY AUTOINCREMENT, instrument_token TEXT, transaction_type TEXT, quantity INTEGER, entry_price REAL, highest_price REAL, lowest_price REAL, added_at INTEGER, exit_config TEXT, product TEXT DEFAULT 'D', active INTEGER DEFAULT 1);
+  CREATE TABLE IF NOT EXISTS positions (id INTEGER PRIMARY KEY AUTOINCREMENT, instrument_token TEXT, transaction_type TEXT, quantity INTEGER, entry_price REAL, highest_price REAL, lowest_price REAL, added_at INTEGER, exit_config TEXT, product TEXT DEFAULT 'D', active INTEGER DEFAULT 1, hedge_id TEXT, leg_type TEXT);
   CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, level TEXT, message TEXT);
 `);
+try { db.exec("ALTER TABLE positions ADD COLUMN hedge_id TEXT"); } catch(e) {}
+try { db.exec("ALTER TABLE positions ADD COLUMN leg_type TEXT"); } catch(e) {}
 try { db.exec("ALTER TABLE positions ADD COLUMN product TEXT DEFAULT 'D'"); } catch(e) {}
 
 // --- Helpers ---
@@ -235,6 +237,37 @@ async function calculateATM(accessToken, instrumentKey, optionType, expiryDate, 
   }
   return { spot, atm_strike: atm.strike_price, instrument_key: atm.instrument_key, trading_symbol: atm.trading_symbol, lot_size: atm.lot_size, expiry: nearestExpiry };
 }
+
+// --- Find nearest futures contract for an underlying ---
+async function findFuturesContract(accessToken, instrumentKey) {
+  const url = `https://api.upstox.com/v2/instruments/search?query=${encodeURIComponent(instrumentKey.split('|')[1] || 'NIFTY')}&segments=FO`;
+  const resp = await fetchIPv4(url, { headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` } });
+  const text = await resp.text();
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!resp.ok || !data || !data.data) {
+    console.log('[FUTURES] Search API failed, trying option/contract endpoint');
+    const altUrl = `https://api.upstox.com/v2/option/contract?instrument_key=${encodeURIComponent(instrumentKey)}`;
+    const altResp = await fetchIPv4(altUrl, { headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` } });
+    const altText = await altResp.text();
+    let altData; try { altData = JSON.parse(altText); } catch { altData = { raw: altText }; }
+    if (!altResp.ok || !altData || !altData.data) return null;
+    const futContracts = altData.data.filter(c => c.instrument_type === 'FUTIDX' || c.instrument_type === 'FUTSTK' || c.instrument_type === 'FUT');
+    if (futContracts.length === 0) return null;
+    const expiries = [...new Set(futContracts.map(c => c.expiry))].sort();
+    const nearestExpiry = expiries[0];
+    const fut = futContracts.find(c => c.expiry === nearestExpiry) || futContracts[0];
+    return { instrument_key: fut.instrument_key, trading_symbol: fut.trading_symbol, lot_size: fut.lot_size, expiry: nearestExpiry };
+  }
+  const futContracts = data.data.filter(c => (c.instrument_type === 'FUTIDX' || c.instrument_type === 'FUTSTK' || c.instrument_type === 'FUT') && c.segment === 'NSE_FO');
+  if (futContracts.length === 0) return null;
+  const expiries = [...new Set(futContracts.map(c => c.expiry))].filter(e => e).sort();
+  if (expiries.length === 0) return null;
+  const nearestExpiry = expiries[0];
+  const fut = futContracts.find(c => c.expiry === nearestExpiry) || futContracts[0];
+  console.log(`[FUTURES] Found: ${fut.trading_symbol || fut.instrument_key}, expiry: ${nearestExpiry}, lot: ${fut.lot_size}`);
+  return { instrument_key: fut.instrument_key, trading_symbol: fut.trading_symbol, lot_size: fut.lot_size, expiry: nearestExpiry };
+}
+
 
 // --- Webhook URL endpoint — returns the REAL webhook URL with actual secret ---
 app.get("/api/webhook-url", (req, res) => {
@@ -421,6 +454,7 @@ async function checkExits() {
     const exitCfg = pos.exit_config ? JSON.parse(pos.exit_config) : {};
     // Skip strategy-managed positions — strategy engine handles its own exits
     if (exitCfg.strategy_managed) continue;
+    if (exitCfg.hedge_id || pos.hedge_id) continue;
 
     // Each position can have its OWN exit config (from webhook CE/PE legs)
     // If position has its own mode, use it. Otherwise fall back to global config.
@@ -669,9 +703,15 @@ app.post("/webhook", async (req, res) => {
     action = "SELL"; forcedOptionType = "CE";
   } else if (actionLower === "sell_pe" || actionLower === "sellpe") {
     action = "SELL"; forcedOptionType = "PE";
+  } else if (actionLower === "buy_future_hedge" || actionLower === "buy_fh") {
+    action = "BUY_FUTURE_HEDGE";
+  } else if (actionLower === "sell_future_hedge" || actionLower === "sell_fh") {
+    action = "SELL_FUTURE_HEDGE";
+  } else if (actionLower === "exit_future_hedge" || actionLower === "exit_fh") {
+    action = "EXIT_FUTURE_HEDGE";
   }
 
-  if (!["BUY", "SELL"].includes(action)) {
+  if (!["BUY", "SELL", "BUY_FUTURE_HEDGE", "SELL_FUTURE_HEDGE", "EXIT_FUTURE_HEDGE"].includes(action)) {
     logSignal(rawText.substring(0, 1000), payload, "invalid_action");
     return res.json({ status: "error", message: `invalid action: "${action}". Send {"action":"BUY"} or {"action":"buy_ce"} or {"action":"buy_pe"}` });
   }
@@ -745,6 +785,138 @@ app.post("/webhook", async (req, res) => {
     payload.product = legProduct;
     console.log(`[WEBHOOK] ATM: ${atm.atm_strike} ${legOptionType} (spot ${atm.spot}), token ${instrumentToken}, qty ${quantity}`);
   }
+
+  
+  // ========== FUTURES HEDGE STRATEGY ==========
+  if (action === "BUY_FUTURE_HEDGE" || action === "SELL_FUTURE_HEDGE") {
+    // BUY_FUTURE_HEDGE: Bullish → BUY futures + BUY OTM PE (protective put, cheap)
+    // SELL_FUTURE_HEDGE: Bearish → SELL futures + BUY OTM CE (protective call, cheap)
+    const tcfg = getTradingConfig();
+    const futDirection = action === "BUY_FUTURE_HEDGE" ? "BUY" : "SELL";
+    const hedgeOptionType = action === "BUY_FUTURE_HEDGE" ? "PE" : "CE";
+    const hedgeId = `HEDGE_${Date.now()}`;
+    // strike_offset: how far OTM (default 2 = 2 strikes away = cheaper option)
+    const strikeOffset = parseInt(payload.strike_offset ?? 2, 10);
+    console.log(`[HEDGE] Starting ${action}: Fut=${futDirection}, Option=BUY ${hedgeOptionType} (OTM offset=${strikeOffset}), hedge_id=${hedgeId}`);
+
+    // Step 1: Find futures contract + spot price in parallel
+    const [futResult, spotResult] = await Promise.all([
+      findFuturesContract(token, tcfg.underlying),
+      getLTP(token, tcfg.underlying)
+    ]);
+    if (!futResult) {
+      logSignal(rawText.substring(0, 1000), payload, "hedge_futures_not_found");
+      return res.json({ status: "error", message: "Could not find futures contract" });
+    }
+    if (!spotResult) {
+      logSignal(rawText.substring(0, 1000), payload, "hedge_spot_failed");
+      return res.json({ status: "error", message: "Could not fetch spot price for hedge" });
+    }
+
+    // Calculate OTM strike for protective option
+    const symbol = tcfg.underlying_name || 'NIFTY';
+    const strikeInterval = symbol.includes('BANK') ? 100 : 50;
+    const atmStrike = Math.round(spotResult / strikeInterval) * strikeInterval;
+    let hedgeStrike;
+    if (hedgeOptionType === 'PE') {
+      hedgeStrike = atmStrike - (strikeOffset * strikeInterval);
+    } else {
+      hedgeStrike = atmStrike + (strikeOffset * strikeInterval);
+    }
+    console.log(`[HEDGE] Spot: ${spotResult}, ATM: ${atmStrike}, OTM ${hedgeOptionType} strike: ${hedgeStrike}`);
+
+    // Fetch option contracts to find the OTM strike
+    const optResult = await getOptionContracts(token, tcfg.underlying, null);
+    if (!optResult.ok) {
+      logSignal(rawText.substring(0, 1000), payload, "hedge_option_contract_failed");
+      return res.json({ status: "error", message: "Could not fetch option contracts for hedge" });
+    }
+    const allContracts = (optResult.data && optResult.data.data) || [];
+    const expiries = [...new Set(allContracts.map(c => c.expiry))].sort();
+    if (expiries.length === 0) {
+      return res.json({ status: "error", message: "No option expiries found" });
+    }
+    const nearestExpiry = expiries[0];
+    let hedgeContract = allContracts.find(c => c.expiry === nearestExpiry && c.instrument_type === hedgeOptionType && c.strike_price === hedgeStrike);
+    if (!hedgeContract) {
+      const typed = allContracts.filter(c => c.expiry === nearestExpiry && c.instrument_type === hedgeOptionType);
+      let closest = typed[0], minDiff = Math.abs(typed[0].strike_price - hedgeStrike);
+      for (const t of typed) { const d = Math.abs(t.strike_price - hedgeStrike); if (d < minDiff) { minDiff = d; closest = t; } }
+      console.log(`[HEDGE] Exact strike ${hedgeStrike} not found, using closest: ${closest.strike_price}`);
+      hedgeStrike = closest.strike_price;
+      hedgeContract = closest;
+    }
+    const hedgeInstrumentKey = hedgeContract.instrument_key;
+
+    // Fetch LTP for both legs
+    const [optionLTP, futLTP] = await Promise.all([
+      getLTP(token, hedgeInstrumentKey),
+      getLTP(token, futResult.instrument_key)
+    ]);
+    if (!optionLTP || !futLTP) {
+      logSignal(rawText.substring(0, 1000), payload, "hedge_ltp_failed");
+      return res.json({ status: "error", message: "Could not fetch LTP for hedge legs" });
+    }
+    const futQty = parseInt(tcfg.lots || 1, 10) * parseInt(futResult.lot_size || tcfg.lot_size || 65, 10);
+    const optQty = parseInt(tcfg.lots || 1, 10) * parseInt(tcfg.lot_size || 65, 10);
+    const legProduct = tcfg.product || 'D';
+    console.log(`[HEDGE] Futures: ${futResult.trading_symbol} @ ${futLTP}, qty=${futQty}`);
+    console.log(`[HEDGE] Option: ${hedgeContract.trading_symbol} @ ${optionLTP}, strike=${hedgeStrike}, qty=${optQty}`);
+
+    // Step 2: Place BOTH orders simultaneously
+    const [futOrder, optOrder] = await Promise.all([
+      placeUpstoxOrder(token, { quantity: futQty, product: legProduct, validity: "DAY", order_type: "MARKET", transaction_type: futDirection, instrument_token: futResult.instrument_key, tag: "hedge_fut" }),
+      placeUpstoxOrder(token, { quantity: optQty, product: legProduct, validity: "DAY", order_type: "MARKET", transaction_type: "BUY", instrument_token: hedgeInstrumentKey, tag: "hedge_opt" })
+    ]);
+    const bothOk = futOrder.ok && optOrder.ok;
+    console.log(`[HEDGE] Futures: ${futOrder.ok ? 'OK' : 'FAILED'}, Option: ${optOrder.ok ? 'OK' : 'FAILED'}`);
+
+    if (!bothOk) {
+      if (futOrder.ok && !optOrder.ok) { console.log('[HEDGE] Option failed — closing futures leg'); await placeExitOrder(token, futResult.instrument_key, futQty, futDirection === "BUY" ? "SELL" : "BUY", legProduct); }
+      if (optOrder.ok && !futOrder.ok) { console.log('[HEDGE] Futures failed — closing option leg'); await placeExitOrder(token, hedgeInstrumentKey, optQty, "SELL", legProduct); }
+      logSignal(rawText.substring(0, 1000), payload, "hedge_partial_fail");
+      return res.json({ status: "error", message: "One hedge leg failed — other leg reversed. No naked position." });
+    }
+
+    // Step 3: Track BOTH positions with same hedge_id
+    const exitTarget = parseFloat(payload.exit_target_points ?? 40);
+    const exitSL = parseFloat(payload.exit_sl_points ?? 25);
+    const posExitOpt = { mode: "fixed_sl_target", fixed_target_points: exitTarget, fixed_sl_points: exitSL, option_type: hedgeOptionType, hedge_id: hedgeId };
+    const posExitFut = { mode: "fixed_sl_target", fixed_target_points: exitTarget, fixed_sl_points: exitSL, hedge_id: hedgeId, hedge_role: "futures" };
+    db.prepare("INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active, hedge_id, leg_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)").run(futResult.instrument_key, futDirection, futQty, futLTP, futLTP, futLTP, Date.now(), JSON.stringify(posExitFut), legProduct, hedgeId, "futures");
+    db.prepare("INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active, hedge_id, leg_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)").run(hedgeInstrumentKey, "BUY", optQty, optionLTP, optionLTP, optionLTP, Date.now(), JSON.stringify(posExitOpt), legProduct, hedgeId, "option");
+    logSignal(rawText.substring(0, 1000), payload, "hedge_placed");
+    logOrder("hedge", futDirection, futResult.instrument_key, futQty, futOrder.data, true);
+    logOrder("hedge", "BUY", hedgeInstrumentKey, optQty, optOrder.data, true);
+    addLog("INFO", `Hedge placed: ${futDirection} ${futQty} futures @ ${futLTP} + BUY ${optQty} ${hedgeOptionType} @ strike ${hedgeStrike} premium ${optionLTP}, hedge_id=${hedgeId}`);
+    return res.json({ status: "hedge_placed", hedge_id: hedgeId, futures: { instrument: futResult.instrument_key, direction: futDirection, qty: futQty, price: futLTP, order: futOrder.data }, option: { instrument: hedgeInstrumentKey, type: hedgeOptionType, strike: hedgeStrike, qty: optQty, price: optionLTP, order: optOrder.data } });
+  }
+
+  // ========== EXIT FUTURES HEDGE (close both legs simultaneously) ==========
+  if (action === "EXIT_FUTURE_HEDGE") {
+    const hedgePositions = db.prepare("SELECT * FROM positions WHERE active = 1 AND hedge_id IS NOT NULL").all();
+    if (hedgePositions.length === 0) {
+      logSignal(rawText.substring(0, 1000), payload, "hedge_exit_no_position");
+      return res.json({ status: "rejected", reason: "No active hedge positions to exit" });
+    }
+    const closePromises = [];
+    const closeInfo = [];
+    for (const pos of hedgePositions) {
+      const exitSide = pos.transaction_type === "BUY" ? "SELL" : "BUY";
+      closePromises.push(placeExitOrder(token, pos.instrument_token, pos.quantity, exitSide, pos.product || 'D'));
+      closeInfo.push({ hedge_id: pos.hedge_id, instrument: pos.instrument_token, side: exitSide, qty: pos.quantity, posId: pos.id });
+    }
+    const results = await Promise.all(closePromises);
+    const allOk = results.every(r => r.ok);
+    for (let i = 0; i < closeInfo.length; i++) {
+      db.prepare("UPDATE positions SET active = 0 WHERE id = ?").run(closeInfo[i].posId);
+      logOrder("hedge_exit", closeInfo[i].side, closeInfo[i].instrument, closeInfo[i].qty, results[i].data, results[i].ok);
+    }
+    logSignal(rawText.substring(0, 1000), payload, allOk ? "hedge_exited" : "hedge_exit_partial");
+    addLog("INFO", `Hedge exit: ${closeInfo.length} legs closed simultaneously, allOk=${allOk}`);
+    return res.json({ status: allOk ? "hedge_exited" : "hedge_exit_partial", legs_closed: closeInfo.length, results: results.map(r => r.data) });
+  }
+
 
   // SAFETY GUARD: If action is SELL, check if there's an active BUY position to exit.
   // Reject naked short sells — prevents accidental sell orders without a prior buy.

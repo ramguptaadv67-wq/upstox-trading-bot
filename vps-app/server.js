@@ -1481,7 +1481,27 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 
 
   </div>
-  
+  <div class="section-divider"></div>
+  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Hedge Option Strike Offset</h2>
+  <div class="form-row" style="align-items:center;">
+    <div style="flex:1;">
+      <label>Option Strike (for futures hedge)</label>
+      <select id="tcStrikeOffset">
+        <option value="1">1 strike from ATM (costliest, max protection)</option>
+        <option value="2" selected>2 strikes from ATM</option>
+        <option value="3">3 strikes from ATM</option>
+        <option value="4">4 strikes from ATM</option>
+        <option value="5">5 strikes from ATM</option>
+        <option value="6">6 strikes from ATM (cheapest, min protection)</option>
+        <option value="8">8 strikes from ATM</option>
+        <option value="10">10 strikes from ATM</option>
+      </select>
+    </div>
+    <div style="margin-left:12px;font-size:0.75rem;color:#8b949e;max-width:200px;">
+      Lower = more protection but costlier option. Higher = cheaper option, less protection.
+    </div>
+  </div>
+  <div class="section-divider"></div>
   <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">TradingView Webhook Setup</h2>
   <p class="muted" style="margin-bottom:6px;">Webhook URL:</p>
   <div class="json-box" id="tcWebhookUrl" style="font-size:0.75rem;"></div>

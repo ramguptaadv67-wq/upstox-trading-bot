@@ -1451,7 +1451,13 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
         <label class="toggle"><input type="checkbox" id="tcPeEnabled" checked><span class="slider"></span></label>
         <span style="margin-left:8px;font-weight:600;">Enable PE leg</span>
       </div>
-  <div class="section-divider"></div>
+  
+
+      <div><label>Lots</label><input id="tcPeLots" type="number" value="1" min="1"></div>
+      <div style="margin-top:6px;"><label>Product</label><select id="tcPeProduct"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
+      
+    </div>
+<div class="section-divider"></div>
   <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Hedge Option Strike Offset</h2>
   <div class="form-row" style="align-items:center;">
     <div style="flex:1;">
@@ -1472,10 +1478,6 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
     </div>
   </div>
 
-      <div><label>Lots</label><input id="tcPeLots" type="number" value="1" min="1"></div>
-      <div style="margin-top:6px;"><label>Product</label><select id="tcPeProduct"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
-      
-    </div>
   </div>
   
   <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">TradingView Webhook Setup</h2>

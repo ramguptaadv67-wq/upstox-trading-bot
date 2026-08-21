@@ -464,7 +464,7 @@ const OPTION_CACHE_TTL = 6 * 3600000; // 6 hours — contracts don't change intr
 
 async function getOptionContracts(accessToken, instrumentKey, expiryDate) {
 
-  const _ock = 'opt_' + underlyingKey;
+  const _ock = 'opt_' + instrumentKey;
   const _ocached = getCached(_ock);
   if (_ocached) { console.log('[CACHE] Hit for option contracts'); return _ocached; }
   const cacheKey = instrumentKey;

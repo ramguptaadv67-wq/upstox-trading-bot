@@ -667,7 +667,10 @@ setInterval(async () => {
 // --- Dedupe ---
 const recentSignals = new Map();
 function isDuplicate(payload) {
-  const key = JSON.stringify(payload);
+  // Deduplicate by action only — TradingView may include varying fields 
+  // (timestamps, prices) that make identical alerts look different.
+  const action = String(payload.action || payload.side || payload.signal || "").toUpperCase().trim();
+  const key = action;  // e.g. "BUY_CE" — two buy_ce alerts within 5s = duplicate
   if (recentSignals.has(key)) return true;
   recentSignals.set(key, true);
   setTimeout(() => recentSignals.delete(key), 5000);

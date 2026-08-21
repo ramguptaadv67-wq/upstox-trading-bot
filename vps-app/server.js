@@ -73,6 +73,13 @@ app.use("/api", (req, res, next) => {
 });
 
 // --- Database ---
+
+// === INSTRUMENT CACHE — avoids repeated API calls for same data ===
+const _instCache = {};
+const _CACHE_TTL = 60000; // 60 seconds
+function getCached(key) { const e = _instCache[key]; if (e && Date.now() - e.ts < _CACHE_TTL) return e.data; return null; }
+function setCached(key, data) { _instCache[key] = { ts: Date.now(), data }; }
+
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 db.exec(`
@@ -244,6 +251,10 @@ async function calculateATM(accessToken, instrumentKey, optionType, expiryDate, 
 
 // --- Find nearest futures contract for an underlying ---
 async function findFuturesContract(accessToken, instrumentKey) {
+
+  const _ck = 'fut_' + underlying;
+  const _cached = getCached(_ck);
+  if (_cached) { console.log('[CACHE] Hit for futures contract'); return _cached; }
   const url = `https://api.upstox.com/v2/instruments/search?query=${encodeURIComponent(instrumentKey.split('|')[1] || 'NIFTY')}&segments=FO`;
   const resp = await fetchIPv4(url, { headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}` } });
   const text = await resp.text();
@@ -260,6 +271,7 @@ async function findFuturesContract(accessToken, instrumentKey) {
     const expiries = [...new Set(futContracts.map(c => c.expiry))].sort();
     const nearestExpiry = expiries[0];
     const fut = futContracts.find(c => c.expiry === nearestExpiry) || futContracts[0];
+  setCached(_ck, { instrument_key: fut.instrument_key, trading_symbol: fut.trading_symbol, lot_size: fut.lot_size, expiry: nearestExpiry });
     return { instrument_key: fut.instrument_key, trading_symbol: fut.trading_symbol, lot_size: fut.lot_size, expiry: nearestExpiry };
   }
   const futContracts = data.data.filter(c => (c.instrument_type === 'FUTIDX' || c.instrument_type === 'FUTSTK' || c.instrument_type === 'FUT') && c.segment === 'NSE_FO');
@@ -443,6 +455,10 @@ let _optionContractsCache = {}; // key: instrumentKey -> { data, timestamp }
 const OPTION_CACHE_TTL = 6 * 3600000; // 6 hours — contracts don't change intraday
 
 async function getOptionContracts(accessToken, instrumentKey, expiryDate) {
+
+  const _ock = 'opt_' + underlyingKey;
+  const _ocached = getCached(_ock);
+  if (_ocached) { console.log('[CACHE] Hit for option contracts'); return _ocached; }
   const cacheKey = instrumentKey;
   const cached = _optionContractsCache[cacheKey];
   if (cached && (Date.now() - cached.timestamp) < OPTION_CACHE_TTL) {
@@ -451,6 +467,7 @@ async function getOptionContracts(accessToken, instrumentKey, expiryDate) {
     if (expiryDate) {
       contracts = contracts.filter(c => c.expiry === expiryDate);
     }
+  if (result) setCached(_ock, result);
     return { ok: true, status: 200, data: { data: cached.data } };
   }
   let url = `https://api.upstox.com/v2/option/contract?instrument_key=${encodeURIComponent(instrumentKey)}`;
@@ -860,18 +877,19 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       const [peLTP, futLTP] = await Promise.all([getLTP(token, peContract.instrument_key), getLTP(token, futResult.instrument_key)]);
       if (!peLTP || !futLTP) { addLog("ERROR", `${signalId}: Could not fetch LTP for hedge legs`); return; }
 
-      // Check margin (basket = hedge benefit)
-      const marginInfo = await getBasketMargin(token, [
-        { instrument_key: futResult.instrument_key, quantity: futQty, transaction_type: "BUY", product: legProduct },
-        { instrument_key: peContract.instrument_key, quantity: optQty, transaction_type: "BUY", product: legProduct }
+      // Check margin + funds IN PARALLEL (saves ~200-400ms)
+      const [marginInfo, funds] = await Promise.all([
+        getBasketMargin(token, [
+          { instrument_key: futResult.instrument_key, quantity: futQty, transaction_type: "BUY", product: legProduct },
+          { instrument_key: peContract.instrument_key, quantity: optQty, transaction_type: "BUY", product: legProduct }
+        ]),
+        getAvailableFunds(token)
       ]);
       if (marginInfo) {
         console.log(`[HEDGE] Margin: required=${marginInfo.required_margin}, final=${marginInfo.final_margin} (benefit: ${marginInfo.benefit})`);
         addLog("INFO", `Hedge margin: required ${marginInfo.required_margin}, after benefit ${marginInfo.final_margin} (save ${Math.round(marginInfo.benefit)})`);
       }
-
-      // Step 1: Check available funds BEFORE placing any orders
-      const funds = await getAvailableFunds(token);
+      console.log(`[HEDGE] Available funds: ${funds ? funds.available_margin : 'unknown'}`);
       console.log(`[HEDGE] Available funds: ${funds ? funds.available_margin : 'unknown'}`);
       if (funds && marginInfo && marginInfo.final_margin > funds.available_margin) {
         const shortfall = Math.ceil(marginInfo.final_margin - funds.available_margin);
@@ -987,13 +1005,13 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       const [ceLTP, futLTP] = await Promise.all([getLTP(token, ceContract.instrument_key), getLTP(token, futResult.instrument_key)]);
       if (!ceLTP || !futLTP) { addLog("ERROR", `${signalId}: Could not fetch LTP for hedge legs`); return; }
 
-      const marginInfo = await getBasketMargin(token, [
-        { instrument_key: futResult.instrument_key, quantity: futQty, transaction_type: "SELL", product: legProduct },
-        { instrument_key: ceContract.instrument_key, quantity: optQty, transaction_type: "BUY", product: legProduct }
+      const [marginInfo, funds] = await Promise.all([
+        getBasketMargin(token, [
+          { instrument_key: futResult.instrument_key, quantity: futQty, transaction_type: "SELL", product: legProduct },
+          { instrument_key: ceContract.instrument_key, quantity: optQty, transaction_type: "BUY", product: legProduct }
+        ]),
+        getAvailableFunds(token)
       ]);
-
-      // Pre-check funds
-      const funds = await getAvailableFunds(token);
       if (funds && marginInfo && marginInfo.final_margin > funds.available_margin) {
         const shortfall = Math.ceil(marginInfo.final_margin - funds.available_margin);
         console.log(`[HEDGE] INSUFFICIENT FUNDS: need ${marginInfo.final_margin}, have ${funds.available_margin}`);

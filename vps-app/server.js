@@ -1153,7 +1153,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
 
   logSignal(rawText.substring(0, 1000), payload, result.ok ? "order_placed" : "order_failed");
   logOrder(action === "SELL" ? "exit" : "entry", action, instrumentToken, quantity, result.data, result.ok);
-  res.json({ status: result.ok ? "order_placed" : "order_failed", action, instrument_token: instrumentToken, quantity, upstox: result.data });
+  if (result.ok) { addLog("INFO", `${signalId}: ✅ Order placed — ${action} ${quantity} ${instrumentToken}`); } else { addLog("ERROR", `${signalId}: ❌ Order failed — ${JSON.stringify(result.data).substring(0, 200)}`); }
 
   // Position tracking for plain BUY
   if (result.ok && action !== "SELL") {

@@ -781,20 +781,46 @@ app.post("/webhook", async (req, res) => {
     return res.json({ status: "duplicate" });
   }
 
-  const { token, expiry } = await getToken();
-  if (!token || Date.now() >= expiry) {
-    logSignal(rawText.substring(0, 1000), payload, "no_token");
-    return res.json({ status: "error", message: "no Upstox access token" });
-  }
-
-  if (!isMarketOpen()) {
-    logSignal(rawText.substring(0, 1000), payload, "market_closed");
-    return res.json({ status: "error", message: "Market is closed. Orders can only be placed during market hours (9:15 AM - 3:30 PM IST, Mon-Fri)." });
-  }
-
+  // ============================================================
+  // LIGHTNING-FAST RESPONSE: Acknowledge TradingView IMMEDIATELY
+  // TradingView cancels any webhook that doesn't respond within 3 seconds.
+  // We respond in <1ms, then process the trade in the background.
+  // ============================================================
+  const signalId = `SIG_${Date.now()}`;
   const tcfg = getTradingConfig();
+  res.status(200).json({ status: "accepted", signal_id: signalId, action: action, option_type: forcedOptionType, message: "Signal received — processing" });
+  console.log(`[WEBHOOK] ⚡ Responded instantly — signal ${signalId} accepted, processing in background`);
+
+  // Process the trade in the background (fire-and-forget)
+  setImmediate(() => {
+    processSignalInBackground(signalId, rawText, payload, action, forcedOptionType, tcfg).catch(e => {
+      console.error(`[BG] Signal ${signalId} error:`, e.message);
+      addLog("ERROR", `Signal ${signalId} failed: ${e.message}`);
+    });
+  });
+  return;
+
+}); // end of app.post("/webhook")
+
+// ============================================================
+// Background signal processor — runs AFTER TradingView gets 200 OK
+// ============================================================
+async function processSignalInBackground(signalId, rawText, payload, action, forcedOptionType, tcfg) {
   const hedgeId = `HEDGE_${Date.now()}`;
   const strikeOffset = parseInt(payload.strike_offset ?? tcfg.strike_offset ?? 2, 10);
+  const { token, expiry } = await getToken();
+  if (!token || Date.now() >= expiry) {
+    console.log(`[BG] ${signalId}: No valid token`);
+    logSignal(rawText.substring(0, 1000), payload, "no_token");
+    addLog("ERROR", `Signal ${signalId}: No Upstox access token — click Request New Token`);
+    return;
+  }
+  if (!isMarketOpen()) {
+    console.log(`[BG] ${signalId}: Market closed`);
+    logSignal(rawText.substring(0, 1000), payload, "market_closed");
+    addLog("WARN", `Signal ${signalId}: Market is closed`);
+    return;
+  }
 
   // ============================================================
   // BUY + CE = buy_ce → BUY futures + BUY OTM PE
@@ -808,7 +834,7 @@ app.post("/webhook", async (req, res) => {
       ]);
       if (!futResult || !spotResult) {
         logSignal(rawText.substring(0, 1000), payload, "hedge_setup_failed");
-        return res.json({ status: "error", message: "Could not find futures contract or fetch spot" });
+        addLog("ERROR", `${signalId}: Could not find futures contract or fetch spot`); return;
       }
       const symbol = tcfg.underlying_name || "NIFTY";
       const strikeInterval = symbol.includes("BANK") ? 100 : 50;
@@ -816,10 +842,10 @@ app.post("/webhook", async (req, res) => {
       const peStrike = atmStrike - (strikeOffset * strikeInterval);
       console.log(`[HEDGE] Spot: ${spotResult}, ATM: ${atmStrike}, OTM PE strike: ${peStrike}`);
       const optResult = await getOptionContracts(token, tcfg.underlying, null);
-      if (!optResult.ok) { return res.json({ status: "error", message: "Could not fetch option contracts" }); }
+      if (!optResult.ok) { addLog("ERROR", `${signalId}: Could not fetch option contracts`); return; }
       const allContracts = (optResult.data && optResult.data.data) || [];
       const expiries = [...new Set(allContracts.map(x => x.expiry))].sort();
-      if (expiries.length === 0) { return res.json({ status: "error", message: "No option expiries" }); }
+      if (expiries.length === 0) { addLog("ERROR", `${signalId}: No option expiries`); return; }
       const nearestExpiry = expiries[0];
       let peContract = allContracts.find(x => x.expiry === nearestExpiry && x.instrument_type === "PE" && x.strike_price === peStrike);
       if (!peContract) {
@@ -832,7 +858,7 @@ app.post("/webhook", async (req, res) => {
       const optQty = parseInt(tcfg.lots || 1, 10) * parseInt(tcfg.lot_size || 65, 10);
       const legProduct = tcfg.product || "D";
       const [peLTP, futLTP] = await Promise.all([getLTP(token, peContract.instrument_key), getLTP(token, futResult.instrument_key)]);
-      if (!peLTP || !futLTP) { return res.json({ status: "error", message: "Could not fetch LTP for hedge legs" }); }
+      if (!peLTP || !futLTP) { addLog("ERROR", `${signalId}: Could not fetch LTP for hedge legs`); return; }
 
       // Check margin (basket = hedge benefit)
       const marginInfo = await getBasketMargin(token, [
@@ -852,7 +878,7 @@ app.post("/webhook", async (req, res) => {
         console.log(`[HEDGE] INSUFFICIENT FUNDS: need ${marginInfo.final_margin}, have ${funds.available_margin}, shortfall ${shortfall}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_insufficient_funds");
         addLog("ERROR", `Hedge rejected: need ${marginInfo.final_margin} margin, have ${funds.available_margin}. Add ${shortfall} to account.`);
-        return res.json({ status: "error", message: `Insufficient funds. Need ${marginInfo.final_margin} margin (after hedge benefit), have ${funds.available_margin}. Please add ${shortfall} to your Upstox account.` });
+        addLog("ERROR", `${signalId}: Insufficient funds — need ${marginInfo.final_margin}, have ${funds.available_margin}, add ${shortfall}`); return;
       }
 
       // Step 2: Place OPTION (hedge) FIRST — exchange registers hedge position
@@ -861,7 +887,7 @@ app.post("/webhook", async (req, res) => {
       console.log(`[HEDGE] PE order: ${peOrder.ok ? "OK" : "FAILED"}`);
       if (!peOrder.ok) {
         logSignal(rawText.substring(0, 1000), payload, "hedge_pe_failed");
-        return res.json({ status: "error", message: "PE hedge order failed. No futures placed — no naked position." });
+        addLog("ERROR", `${signalId}: PE hedge order failed. No futures placed`); return;
       }
       // Wait 1.5 seconds for exchange to register the hedge position
       await new Promise(r => setTimeout(r, 1500));
@@ -874,7 +900,7 @@ app.post("/webhook", async (req, res) => {
         console.log(`[HEDGE] PE reversal: ${reversePe.ok ? "OK" : "FAILED"}`);
         if (!reversePe.ok) addLog("ERROR", `CRITICAL: PE reversal failed — manual exit needed for ${peContract.instrument_key}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_fut_failed");
-        return res.json({ status: "error", message: "Futures order failed. PE reversed. Check funds." });
+        addLog("ERROR", `${signalId}: Futures order failed. PE reversed. Check funds.`); return;
       }
 
       // Track futures position
@@ -888,11 +914,11 @@ app.post("/webhook", async (req, res) => {
       logOrder("hedge", "BUY", futResult.instrument_key, futQty, futOrder.data, true);
       logOrder("hedge", "BUY", peContract.instrument_key, optQty, peOrder.data, true);
       addLog("INFO", `buy_ce hedge: BUY ${futQty} futures @ ${futLTP} + BUY ${optQty} PE @ ${peLTP} (strike ${peContract.strike_price}), hedge_id=${hedgeId}`);
-      return res.json({ status: "hedge_placed", hedge_id: hedgeId, futures: { instrument: futResult.instrument_key, qty: futQty, price: futLTP }, option: { instrument: peContract.instrument_key, type: "PE", strike: peContract.strike_price, qty: optQty, price: peLTP }, margin: marginInfo });
+      addLog("INFO", `${signalId}: ✅ buy_ce hedge placed — BUY ${futQty} futures @ ${futLTP} + BUY ${optQty} PE @ ${peLTP} (strike ${peContract.strike_price})`); return;
     } catch (e) {
       console.error("[HEDGE] buy_ce error:", e.message);
       logSignal(rawText.substring(0, 1000), payload, "hedge_error");
-      return res.json({ status: "error", message: "Hedge error: " + e.message });
+      addLog("ERROR", `${signalId}: Hedge error: ${e.message}`); return;
     }
   }
 
@@ -904,7 +930,7 @@ app.post("/webhook", async (req, res) => {
       const futPos = db.prepare("SELECT * FROM positions WHERE active = 1 AND leg_type = 'futures' AND json_extract(exit_config, '$.direction') = 'long'").all();
       if (futPos.length === 0) {
         logSignal(rawText.substring(0, 1000), payload, "sell_rejected_no_futures");
-        return res.json({ status: "rejected", reason: "No active long futures position to exit. Option stays — exit manually from Positions." });
+        addLog("WARN", `${signalId}: No active long futures to exit`); return;
       }
       const pos = futPos[0];
       const exitResult = await placeExitOrder(token, pos.instrument_token, pos.quantity, "SELL", pos.product || "D");
@@ -913,13 +939,13 @@ app.post("/webhook", async (req, res) => {
         logSignal(rawText.substring(0, 1000), payload, "futures_exited");
         logOrder("hedge_exit", "SELL", pos.instrument_token, pos.quantity, exitResult.data, true);
         addLog("INFO", `sell_ce: Closed futures ${pos.instrument_token} qty ${pos.quantity}. Option stays for manual exit.`);
-        return res.json({ status: "futures_exited", message: "Futures closed. Option stays — exit manually from Positions tab." });
+        addLog("INFO", `${signalId}: ✅ sell_ce — futures closed. Option stays for manual exit.`); return;
       }
       logSignal(rawText.substring(0, 1000), payload, "futures_exit_failed");
-      return res.json({ status: "error", message: "Failed to exit futures" });
+      addLog("ERROR", `${signalId}: Failed to exit futures`); return;
     } catch (e) {
       console.error("[HEDGE] sell_ce error:", e.message);
-      return res.json({ status: "error", message: "Exit error: " + e.message });
+      addLog("ERROR", `${signalId}: Exit error: ${e.message}`); return;
     }
   }
 
@@ -935,7 +961,7 @@ app.post("/webhook", async (req, res) => {
       ]);
       if (!futResult || !spotResult) {
         logSignal(rawText.substring(0, 1000), payload, "hedge_setup_failed");
-        return res.json({ status: "error", message: "Could not find futures contract or fetch spot" });
+        addLog("ERROR", `${signalId}: Could not find futures contract or fetch spot`); return;
       }
       const symbol = tcfg.underlying_name || "NIFTY";
       const strikeInterval = symbol.includes("BANK") ? 100 : 50;
@@ -943,10 +969,10 @@ app.post("/webhook", async (req, res) => {
       const ceStrike = atmStrike + (strikeOffset * strikeInterval);
       console.log(`[HEDGE] Spot: ${spotResult}, ATM: ${atmStrike}, OTM CE strike: ${ceStrike}`);
       const optResult = await getOptionContracts(token, tcfg.underlying, null);
-      if (!optResult.ok) { return res.json({ status: "error", message: "Could not fetch option contracts" }); }
+      if (!optResult.ok) { addLog("ERROR", `${signalId}: Could not fetch option contracts`); return; }
       const allContracts = (optResult.data && optResult.data.data) || [];
       const expiries = [...new Set(allContracts.map(x => x.expiry))].sort();
-      if (expiries.length === 0) { return res.json({ status: "error", message: "No option expiries" }); }
+      if (expiries.length === 0) { addLog("ERROR", `${signalId}: No option expiries`); return; }
       const nearestExpiry = expiries[0];
       let ceContract = allContracts.find(x => x.expiry === nearestExpiry && x.instrument_type === "CE" && x.strike_price === ceStrike);
       if (!ceContract) {
@@ -959,7 +985,7 @@ app.post("/webhook", async (req, res) => {
       const optQty = parseInt(tcfg.lots || 1, 10) * parseInt(tcfg.lot_size || 65, 10);
       const legProduct = tcfg.product || "D";
       const [ceLTP, futLTP] = await Promise.all([getLTP(token, ceContract.instrument_key), getLTP(token, futResult.instrument_key)]);
-      if (!ceLTP || !futLTP) { return res.json({ status: "error", message: "Could not fetch LTP for hedge legs" }); }
+      if (!ceLTP || !futLTP) { addLog("ERROR", `${signalId}: Could not fetch LTP for hedge legs`); return; }
 
       const marginInfo = await getBasketMargin(token, [
         { instrument_key: futResult.instrument_key, quantity: futQty, transaction_type: "SELL", product: legProduct },
@@ -973,7 +999,7 @@ app.post("/webhook", async (req, res) => {
         console.log(`[HEDGE] INSUFFICIENT FUNDS: need ${marginInfo.final_margin}, have ${funds.available_margin}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_insufficient_funds");
         addLog("ERROR", `Hedge rejected: need ${marginInfo.final_margin}, have ${funds.available_margin}. Add ${shortfall}.`);
-        return res.json({ status: "error", message: `Insufficient funds. Need ${marginInfo.final_margin} margin (after hedge), have ${funds.available_margin}. Add ${shortfall}.` });
+        addLog("ERROR", `${signalId}: Insufficient funds — need ${marginInfo.final_margin}, have ${funds.available_margin}, add ${shortfall}`); return;
       }
       if (marginInfo) {
         console.log(`[HEDGE] Margin: required=${marginInfo.required_margin}, final=${marginInfo.final_margin} (benefit: ${marginInfo.benefit})`);
@@ -986,7 +1012,7 @@ app.post("/webhook", async (req, res) => {
       console.log(`[HEDGE] CE order: ${ceOrder.ok ? "OK" : "FAILED"}`);
       if (!ceOrder.ok) {
         logSignal(rawText.substring(0, 1000), payload, "hedge_ce_failed");
-        return res.json({ status: "error", message: "CE hedge order failed. No futures placed — no naked position." });
+        addLog("ERROR", `${signalId}: CE hedge order failed. No futures placed`); return;
       }
       await new Promise(r => setTimeout(r, 1500));
       console.log("[HEDGE] Step 2: Placing futures order (with hedge margin benefit)...");
@@ -997,7 +1023,7 @@ app.post("/webhook", async (req, res) => {
         const reverseCe = await placeExitOrder(token, ceContract.instrument_key, optQty, "SELL", legProduct);
         if (!reverseCe.ok) addLog("ERROR", `CRITICAL: CE reversal failed — manual exit needed for ${ceContract.instrument_key}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_fut_failed");
-        return res.json({ status: "error", message: "Futures order failed. CE reversed. Check funds." });
+        addLog("ERROR", `${signalId}: Futures order failed. CE reversed. Check funds.`); return;
       }
 
       db.prepare("INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active, hedge_id, leg_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
@@ -1009,11 +1035,11 @@ app.post("/webhook", async (req, res) => {
       logOrder("hedge", "SELL", futResult.instrument_key, futQty, futOrder.data, true);
       logOrder("hedge", "BUY", ceContract.instrument_key, optQty, ceOrder.data, true);
       addLog("INFO", `buy_pe hedge: SELL ${futQty} futures @ ${futLTP} + BUY ${optQty} CE @ ${ceLTP} (strike ${ceContract.strike_price}), hedge_id=${hedgeId}`);
-      return res.json({ status: "hedge_placed", hedge_id: hedgeId, futures: { instrument: futResult.instrument_key, qty: futQty, price: futLTP }, option: { instrument: ceContract.instrument_key, type: "CE", strike: ceContract.strike_price, qty: optQty, price: ceLTP }, margin: marginInfo });
+      addLog("INFO", `${signalId}: ✅ buy_pe hedge placed — SELL ${futQty} futures @ ${futLTP} + BUY ${optQty} CE @ ${ceLTP} (strike ${ceContract.strike_price})`); return;
     } catch (e) {
       console.error("[HEDGE] buy_pe error:", e.message);
       logSignal(rawText.substring(0, 1000), payload, "hedge_error");
-      return res.json({ status: "error", message: "Hedge error: " + e.message });
+      addLog("ERROR", `${signalId}: Hedge error: ${e.message}`); return;
     }
   }
 
@@ -1025,7 +1051,7 @@ app.post("/webhook", async (req, res) => {
       const futPos = db.prepare("SELECT * FROM positions WHERE active = 1 AND leg_type = 'futures' AND json_extract(exit_config, '$.direction') = 'short'").all();
       if (futPos.length === 0) {
         logSignal(rawText.substring(0, 1000), payload, "sell_rejected_no_futures");
-        return res.json({ status: "rejected", reason: "No active short futures position to exit. Option stays — exit manually from Positions." });
+        addLog("WARN", `${signalId}: No active short futures to exit`); return;
       }
       const pos = futPos[0];
       const exitResult = await placeExitOrder(token, pos.instrument_token, pos.quantity, "BUY", pos.product || "D");
@@ -1034,13 +1060,13 @@ app.post("/webhook", async (req, res) => {
         logSignal(rawText.substring(0, 1000), payload, "futures_exited");
         logOrder("hedge_exit", "BUY", pos.instrument_token, pos.quantity, exitResult.data, true);
         addLog("INFO", `sell_pe: Closed short futures ${pos.instrument_token} qty ${pos.quantity}. Option stays for manual exit.`);
-        return res.json({ status: "futures_exited", message: "Short futures closed. Option stays — exit manually from Positions tab." });
+        addLog("INFO", `${signalId}: ✅ sell_pe — short futures closed. Option stays for manual exit.`); return;
       }
       logSignal(rawText.substring(0, 1000), payload, "futures_exit_failed");
-      return res.json({ status: "error", message: "Failed to exit futures" });
+      addLog("ERROR", `${signalId}: Failed to exit futures`); return;
     } catch (e) {
       console.error("[HEDGE] sell_pe error:", e.message);
-      return res.json({ status: "error", message: "Exit error: " + e.message });
+      addLog("ERROR", `${signalId}: Exit error: ${e.message}`); return;
     }
   }
 
@@ -1050,7 +1076,7 @@ app.post("/webhook", async (req, res) => {
   // Auto Trade (option-only) check — if futures hedge is OFF, auto must be ON
   if (forcedOptionType && !tcfg.futures_enabled && !tcfg.auto_enabled) {
     logSignal(rawText.substring(0, 1000), payload, "rejected_both_off");
-    return res.json({ status: "rejected", reason: "Both Auto Trade and Futures Hedge are OFF. Enable one in settings." });
+    addLog("WARN", `${signalId}: Both Auto Trade and Futures Hedge are OFF`); return;
   }
   const payloadInstrument = payload.instrument_token || payload.ticker || payload.symbol || payload.instrument_key || "";
   let instrumentToken, quantity, entryPrice;
@@ -1077,7 +1103,7 @@ app.post("/webhook", async (req, res) => {
     const atm = await calculateATM(token, tcfg2.underlying, legOptionType, null);
     if (!atm) {
       logSignal(rawText.substring(0, 1000), payload, "atm_calc_failed");
-      return res.json({ status: "error", message: "Failed to calculate ATM strike. Check trading config." });
+      addLog("ERROR", `${signalId}: Failed to calculate ATM strike`); return;
     }
     instrumentToken = atm.instrument_key;
     quantity = parseInt(legLots, 10) * parseInt(tcfg2.lot_size, 10);
@@ -1106,7 +1132,7 @@ app.post("/webhook", async (req, res) => {
     if (!matchingPosition) {
       console.log("[WEBHOOK] SELL rejected — no open BUY position to exit");
       logSignal(rawText.substring(0, 1000), payload, "sell_rejected_no_position");
-      return res.json({ status: "rejected", reason: "No open position to exit." });
+      addLog("WARN", `${signalId}: No open position to exit`); return;
     }
     if (!payloadInstrument) {
       instrumentToken = matchingPosition.instrument_token;
@@ -1122,7 +1148,7 @@ app.post("/webhook", async (req, res) => {
     });
   } catch (err) {
     logSignal(rawText.substring(0, 1000), payload, "order_api_error");
-    return res.json({ status: "error", message: "Upstox API failed: " + err.message });
+    addLog("ERROR", `${signalId}: Upstox API failed: ${err.message}`); return;
   }
 
   logSignal(rawText.substring(0, 1000), payload, result.ok ? "order_placed" : "order_failed");
@@ -1150,8 +1176,7 @@ app.post("/webhook", async (req, res) => {
     db.prepare("UPDATE positions SET active = 0 WHERE id = ?").run(matchingPosition.id);
     addLog("INFO", `SELL webhook: Position ${matchingPosition.instrument_token} qty ${matchingPosition.quantity} closed`);
   }
-});
-
+} // end of processSignalInBackground
 
 
 

@@ -1510,27 +1510,8 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 </head>
 <body>
 <h1>🐎 Horse Engine <span style="font-size:0.5em;color:var(--green);vertical-align:middle;">● LIVE</span></h1>
-<p class="subtitle">VPS Edition — Updated lot sizes | Points-based exits | 5-second exit engine | ATM auto-select</p>
+<p class="subtitle">VPS Edition v27.1</p>
 <div id="killBanner" class="hidden killed-banner">⚠ BOT OFF — all incoming signals are blocked</div>
-<div class="section-divider"></div>
-  <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Hedge Option Strike Offset</h2>
-  <div class="form-row" style="align-items:center;">
-    <div style="flex:1;">
-      <label>Option Strike (for futures hedge)</label>
-      <select id="tcStrikeOffset">
-        <option value="1">1 strike from ATM (costliest option, max protection)</option>
-        <option value="2" selected>2 strikes from ATM</option>
-        <option value="3">3 strikes from ATM</option>
-        <option value="4">4 strikes from ATM</option>
-        <option value="5">5 strikes from ATM</option>
-        <option value="6">6 strikes from ATM (cheapest, min protection)</option>
-        <option value="8">8 strikes from ATM</option>
-        <option value="10">10 strikes from ATM</option>
-      </select>
-    </div>
-    <div style="margin-left:12px;font-size:0.75rem;color:#8b949e;max-width:200px;">
-      Lower = more protection but costlier option. Higher = cheaper option, less protection.
-    </div>
   </div>
 
 <div class="grid">

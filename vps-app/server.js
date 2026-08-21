@@ -260,7 +260,7 @@ async function calculateATM(accessToken, instrumentKey, optionType, expiryDate, 
 // --- Find nearest futures contract for an underlying ---
 async function findFuturesContract(accessToken, instrumentKey) {
 
-  const _ck = 'fut_' + underlying;
+  const _ck = 'fut_' + instrumentKey;
   const _cached = getCached(_ck);
   if (_cached) { console.log('[CACHE] Hit for futures contract'); return _cached; }
   const url = `https://api.upstox.com/v2/instruments/search?query=${encodeURIComponent(instrumentKey.split('|')[1] || 'NIFTY')}&segments=FO`;
@@ -289,7 +289,9 @@ async function findFuturesContract(accessToken, instrumentKey) {
   const nearestExpiry = expiries[0];
   const fut = futContracts.find(c => c.expiry === nearestExpiry) || futContracts[0];
   console.log(`[FUTURES] Found: ${fut.trading_symbol || fut.instrument_key}, expiry: ${nearestExpiry}, lot: ${fut.lot_size}`);
-  return { instrument_key: fut.instrument_key, trading_symbol: fut.trading_symbol, lot_size: fut.lot_size, expiry: nearestExpiry };
+  const _futResult = { instrument_key: fut.instrument_key, trading_symbol: fut.trading_symbol, lot_size: fut.lot_size, expiry: nearestExpiry };
+  setCached(_ck, _futResult);
+  return _futResult;
 }
 
 // --- Check available funds/margin in Upstox account ---
@@ -475,7 +477,7 @@ async function getOptionContracts(accessToken, instrumentKey, expiryDate) {
     if (expiryDate) {
       contracts = contracts.filter(c => c.expiry === expiryDate);
     }
-    return { ok: true, status: 200, data: { data: cached.data } };
+    return { ok: true, status: 200, data: { data: contracts } };
   }
   let url = `https://api.upstox.com/v2/option/contract?instrument_key=${encodeURIComponent(instrumentKey)}`;
   if (expiryDate) url += `&expiry_date=${encodeURIComponent(expiryDate)}`;
@@ -486,6 +488,7 @@ async function getOptionContracts(accessToken, instrumentKey, expiryDate) {
   if (resp.ok && data && data.data && Array.isArray(data.data)) {
     _optionContractsCache[cacheKey] = { data: data.data, timestamp: Date.now() };
     console.log(`[CACHE] Stored ${data.data.length} option contracts for ${instrumentKey}`);
+    setCached(_ock, { ok: resp.ok, status: resp.status, data });
   }
   return { ok: resp.ok, status: resp.status, data };
 }
@@ -901,13 +904,12 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
         addLog("INFO", `Hedge margin: required ${marginInfo.required_margin}, after benefit ${marginInfo.final_margin} (save ${Math.round(marginInfo.benefit)})`);
       }
       console.log(`[HEDGE] Available funds: ${funds ? funds.available_margin : 'unknown'}`);
-      console.log(`[HEDGE] Available funds: ${funds ? funds.available_margin : 'unknown'}`);
       if (funds && marginInfo && marginInfo.final_margin > funds.available_margin) {
         const shortfall = Math.ceil(marginInfo.final_margin - funds.available_margin);
         console.log(`[HEDGE] INSUFFICIENT FUNDS: need ${marginInfo.final_margin}, have ${funds.available_margin}, shortfall ${shortfall}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_insufficient_funds");
         addLog("ERROR", `Hedge rejected: need ${marginInfo.final_margin} margin, have ${funds.available_margin}. Add ${shortfall} to account.`);
-        updateSignalStatus("insufficient_funds_—_need_margininfo.final_margin,"); addLog("ERROR", `${signalId}: Insufficient funds — need ${marginInfo.final_margin}, have ${funds.available_margin}, add ${shortfall}`); return;
+        updateSignalStatus("insufficient_funds: need " + marginInfo.final_margin + ", have " + funds.available_margin); addLog("ERROR", `${signalId}: Insufficient funds — need ${marginInfo.final_margin}, have ${funds.available_margin}, add ${shortfall}`); return;
       }
 
       // Step 2: Place OPTION (hedge) FIRST — exchange registers hedge position
@@ -947,7 +949,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
     } catch (e) {
       console.error("[HEDGE] buy_ce error:", e.message);
       logSignal(rawText.substring(0, 1000), payload, "hedge_error");
-      updateSignalStatus("hedge_error:_e.message"); addLog("ERROR", `${signalId}: Hedge error: ${e.message}`); return;
+      updateSignalStatus("hedge_error: " + e.message); addLog("ERROR", `${signalId}: Hedge error: ${e.message}`); return;
     }
   }
 
@@ -974,7 +976,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       updateSignalStatus("failed_to_exit_futures"); addLog("ERROR", `${signalId}: Failed to exit futures`); return;
     } catch (e) {
       console.error("[HEDGE] sell_ce error:", e.message);
-      updateSignalStatus("exit_error:_e.message"); addLog("ERROR", `${signalId}: Exit error: ${e.message}`); return;
+      updateSignalStatus("exit_error: " + e.message); addLog("ERROR", `${signalId}: Exit error: ${e.message}`); return;
     }
   }
 
@@ -1028,7 +1030,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
         console.log(`[HEDGE] INSUFFICIENT FUNDS: need ${marginInfo.final_margin}, have ${funds.available_margin}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_insufficient_funds");
         addLog("ERROR", `Hedge rejected: need ${marginInfo.final_margin}, have ${funds.available_margin}. Add ${shortfall}.`);
-        updateSignalStatus("insufficient_funds_—_need_margininfo.final_margin,"); addLog("ERROR", `${signalId}: Insufficient funds — need ${marginInfo.final_margin}, have ${funds.available_margin}, add ${shortfall}`); return;
+        updateSignalStatus("insufficient_funds: need " + marginInfo.final_margin + ", have " + funds.available_margin); addLog("ERROR", `${signalId}: Insufficient funds — need ${marginInfo.final_margin}, have ${funds.available_margin}, add ${shortfall}`); return;
       }
       if (marginInfo) {
         console.log(`[HEDGE] Margin: required=${marginInfo.required_margin}, final=${marginInfo.final_margin} (benefit: ${marginInfo.benefit})`);
@@ -1068,7 +1070,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
     } catch (e) {
       console.error("[HEDGE] buy_pe error:", e.message);
       logSignal(rawText.substring(0, 1000), payload, "hedge_error");
-      updateSignalStatus("hedge_error:_e.message"); addLog("ERROR", `${signalId}: Hedge error: ${e.message}`); return;
+      updateSignalStatus("hedge_error: " + e.message); addLog("ERROR", `${signalId}: Hedge error: ${e.message}`); return;
     }
   }
 
@@ -1095,7 +1097,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       updateSignalStatus("failed_to_exit_futures"); addLog("ERROR", `${signalId}: Failed to exit futures`); return;
     } catch (e) {
       console.error("[HEDGE] sell_pe error:", e.message);
-      updateSignalStatus("exit_error:_e.message"); addLog("ERROR", `${signalId}: Exit error: ${e.message}`); return;
+      updateSignalStatus("exit_error: " + e.message); addLog("ERROR", `${signalId}: Exit error: ${e.message}`); return;
     }
   }
 
@@ -1177,7 +1179,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
     });
   } catch (err) {
     logSignal(rawText.substring(0, 1000), payload, "order_api_error");
-    updateSignalStatus("upstox_api_failed:_err.message"); addLog("ERROR", `${signalId}: Upstox API failed: ${err.message}`); return;
+    updateSignalStatus("upstox_api_failed: " + err.message); addLog("ERROR", `${signalId}: Upstox API failed: ${err.message}`); return;
   }
 
   updateSignalStatus(result.ok ? "order_placed" : "order_failed"); logSignal(rawText.substring(0, 1000), payload, result.ok ? "order_placed" : "order_failed");

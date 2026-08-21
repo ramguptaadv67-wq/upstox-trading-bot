@@ -475,7 +475,6 @@ async function getOptionContracts(accessToken, instrumentKey, expiryDate) {
     if (expiryDate) {
       contracts = contracts.filter(c => c.expiry === expiryDate);
     }
-  if (result) setCached(_ock, result);
     return { ok: true, status: 200, data: { data: cached.data } };
   }
   let url = `https://api.upstox.com/v2/option/contract?instrument_key=${encodeURIComponent(instrumentKey)}`;

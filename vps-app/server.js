@@ -660,7 +660,7 @@ function isDuplicate(payload) {
   const key = JSON.stringify(payload);
   if (recentSignals.has(key)) return true;
   recentSignals.set(key, true);
-  setTimeout(() => recentSignals.delete(key), 10000);
+  setTimeout(() => recentSignals.delete(key), 5000);
   return false;
 }
 
@@ -805,6 +805,9 @@ app.post("/webhook", async (req, res) => {
   // ============================================================
   const signalId = `SIG_${Date.now()}`;
   const tcfg = getTradingConfig();
+  // LOG IMMEDIATELY — so signal appears in dashboard even if background processing fails
+  logSignal(rawText.substring(0, 1000), payload, "received");
+  addLog("INFO", `Signal ${signalId}: ${action} ${forcedOptionType || ''} received — processing`);
   res.status(200).json({ status: "accepted", signal_id: signalId, action: action, option_type: forcedOptionType, message: "Signal received — processing" });
   console.log(`[WEBHOOK] ⚡ Responded instantly — signal ${signalId} accepted, processing in background`);
 

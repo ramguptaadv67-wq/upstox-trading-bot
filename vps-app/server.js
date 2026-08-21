@@ -2090,3 +2090,48 @@ process.on("SIGINT", () => {
   console.log(`Horse Engine running on port ${PORT}`);
   addLog("INFO", "Server started on port " + PORT);
 });
+
+
+// === PRE-WARM CACHE on startup ===
+// Fetches instrument data immediately so the FIRST signal is also fast
+// Re-warms every 50 seconds (before 60s cache expires)
+async function preWarmCache() {
+  try {
+    const { token, expiry } = await getToken();
+    if (!token || Date.now() >= expiry) {
+      console.log('[PREWARM] No valid token — skipping. Click Request New Token.');
+      return;
+    }
+    const tcfg = getTradingConfig();
+    const underlying = tcfg.underlying || 'NSE_INDEX|Nifty 50';
+    console.log('[PREWARM] Warming cache for', underlying, '...');
+
+    const [futResult, optResult] = await Promise.all([
+      findFuturesContract(token, underlying),
+      getOptionContracts(token, underlying, null)
+    ]);
+
+    if (futResult) {
+      console.log('[PREWARM] Futures cached:', futResult.trading_symbol, '(lot:', futResult.lot_size + ')');
+    } else {
+      console.log('[PREWARM] Could not fetch futures contract');
+    }
+
+    if (optResult && optResult.ok) {
+      const contracts = (optResult.data && optResult.data.data) || [];
+      const expiries = [...new Set(contracts.map(x => x.expiry))].sort();
+      console.log('[PREWARM] Options cached:', contracts.length, 'contracts, nearest expiry:', expiries[0] || 'none');
+    } else {
+      console.log('[PREWARM] Could not fetch option contracts');
+    }
+
+    console.log('[PREWARM] Cache warmed — signals will be fast');
+  } catch (e) {
+    console.log('[PREWARM] Error:', e.message);
+  }
+}
+
+// Start pre-warm 3 seconds after startup (allows token DB to be ready)
+setTimeout(preWarmCache, 3000);
+// Re-warm every 50 seconds (before 60s cache TTL expires)
+setInterval(preWarmCache, 50000);

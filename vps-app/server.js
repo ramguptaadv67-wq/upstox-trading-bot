@@ -1539,7 +1539,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 </head>
 <body>
 <h1>🐎 Horse Engine <span style="font-size:0.5em;color:var(--green);vertical-align:middle;">● LIVE</span></h1>
-<p class="subtitle">VPS Edition v28.3</p>
+<p class="subtitle">VPS Edition v28.5</p>
 <div id="killBanner" class="hidden killed-banner">⚠ BOT OFF — all incoming signals are blocked</div>
   </div>
 

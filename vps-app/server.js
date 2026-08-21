@@ -128,6 +128,14 @@ function logSignal(raw, payload, status) {
   db.prepare("INSERT INTO signals (timestamp, raw_message, payload, status) VALUES (?, ?, ?, ?)")
     .run(Date.now(), raw, JSON.stringify(payload), status);
 }
+
+// Update the most recent signal's status (so "received" becomes the final status)
+function updateSignalStatus(newStatus) {
+  try {
+    db.prepare("UPDATE signals SET status = ? WHERE id = (SELECT MAX(id) FROM signals)").run(newStatus);
+  } catch(e) { console.log('[SIGNAL] Update error:', e.message); }
+}
+
 function logOrder(type, action, instrument, qty, result, ok) {
   db.prepare("INSERT INTO orders (timestamp, type, action, instrument_token, quantity, result, ok) VALUES (?, ?, ?, ?, ?, ?, ?)")
     .run(Date.now(), type, action, instrument, qty, JSON.stringify(result), ok ? 1 : 0);
@@ -814,8 +822,9 @@ app.post("/webhook", async (req, res) => {
   // Process the trade in the background (fire-and-forget)
   setImmediate(() => {
     processSignalInBackground(signalId, rawText, payload, action, forcedOptionType, tcfg).catch(e => {
-      console.error(`[BG] Signal ${signalId} error:`, e.message);
-      addLog("ERROR", `Signal ${signalId} failed: ${e.message}`);
+      console.error(`[BG] Signal ${signalId} CRASHED:`, e.message, e.stack);
+      addLog("ERROR", `Signal ${signalId} CRASHED: ${e.message}`);
+      updateSignalStatus("error: " + e.message.substring(0, 100));
     });
   });
   return;
@@ -831,13 +840,13 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
   const { token, expiry } = await getToken();
   if (!token || Date.now() >= expiry) {
     console.log(`[BG] ${signalId}: No valid token`);
-    logSignal(rawText.substring(0, 1000), payload, "no_token");
+    logSignal(rawText.substring(0, 1000), payload, "no_token"); updateSignalStatus("no_token");
     addLog("ERROR", `Signal ${signalId}: No Upstox access token — click Request New Token`);
     return;
   }
   if (!isMarketOpen()) {
     console.log(`[BG] ${signalId}: Market closed`);
-    logSignal(rawText.substring(0, 1000), payload, "market_closed");
+    logSignal(rawText.substring(0, 1000), payload, "market_closed"); updateSignalStatus("market_closed");
     addLog("WARN", `Signal ${signalId}: Market is closed`);
     return;
   }
@@ -854,7 +863,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       ]);
       if (!futResult || !spotResult) {
         logSignal(rawText.substring(0, 1000), payload, "hedge_setup_failed");
-        addLog("ERROR", `${signalId}: Could not find futures contract or fetch spot`); return;
+        updateSignalStatus("could_not_find_futures_contract_or_fetch_spot"); addLog("ERROR", `${signalId}: Could not find futures contract or fetch spot`); return;
       }
       const symbol = tcfg.underlying_name || "NIFTY";
       const strikeInterval = symbol.includes("BANK") ? 100 : 50;
@@ -862,10 +871,10 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       const peStrike = atmStrike - (strikeOffset * strikeInterval);
       console.log(`[HEDGE] Spot: ${spotResult}, ATM: ${atmStrike}, OTM PE strike: ${peStrike}`);
       const optResult = await getOptionContracts(token, tcfg.underlying, null);
-      if (!optResult.ok) { addLog("ERROR", `${signalId}: Could not fetch option contracts`); return; }
+      if (!optResult.ok) { updateSignalStatus("could_not_fetch_option_contracts"); addLog("ERROR", `${signalId}: Could not fetch option contracts`); return; }
       const allContracts = (optResult.data && optResult.data.data) || [];
       const expiries = [...new Set(allContracts.map(x => x.expiry))].sort();
-      if (expiries.length === 0) { addLog("ERROR", `${signalId}: No option expiries`); return; }
+      if (expiries.length === 0) { updateSignalStatus("no_option_expiries"); addLog("ERROR", `${signalId}: No option expiries`); return; }
       const nearestExpiry = expiries[0];
       let peContract = allContracts.find(x => x.expiry === nearestExpiry && x.instrument_type === "PE" && x.strike_price === peStrike);
       if (!peContract) {
@@ -878,7 +887,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       const optQty = parseInt(tcfg.lots || 1, 10) * parseInt(tcfg.lot_size || 65, 10);
       const legProduct = tcfg.product || "D";
       const [peLTP, futLTP] = await Promise.all([getLTP(token, peContract.instrument_key), getLTP(token, futResult.instrument_key)]);
-      if (!peLTP || !futLTP) { addLog("ERROR", `${signalId}: Could not fetch LTP for hedge legs`); return; }
+      if (!peLTP || !futLTP) { updateSignalStatus("could_not_fetch_ltp_for_hedge_legs"); addLog("ERROR", `${signalId}: Could not fetch LTP for hedge legs`); return; }
 
       // Check margin + funds IN PARALLEL (saves ~200-400ms)
       const [marginInfo, funds] = await Promise.all([
@@ -899,7 +908,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
         console.log(`[HEDGE] INSUFFICIENT FUNDS: need ${marginInfo.final_margin}, have ${funds.available_margin}, shortfall ${shortfall}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_insufficient_funds");
         addLog("ERROR", `Hedge rejected: need ${marginInfo.final_margin} margin, have ${funds.available_margin}. Add ${shortfall} to account.`);
-        addLog("ERROR", `${signalId}: Insufficient funds — need ${marginInfo.final_margin}, have ${funds.available_margin}, add ${shortfall}`); return;
+        updateSignalStatus("insufficient_funds_—_need_margininfo.final_margin,"); addLog("ERROR", `${signalId}: Insufficient funds — need ${marginInfo.final_margin}, have ${funds.available_margin}, add ${shortfall}`); return;
       }
 
       // Step 2: Place OPTION (hedge) FIRST — exchange registers hedge position
@@ -908,7 +917,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       console.log(`[HEDGE] PE order: ${peOrder.ok ? "OK" : "FAILED"}`);
       if (!peOrder.ok) {
         logSignal(rawText.substring(0, 1000), payload, "hedge_pe_failed");
-        addLog("ERROR", `${signalId}: PE hedge order failed. No futures placed`); return;
+        updateSignalStatus("pe_hedge_order_failed._no_futures_placed"); addLog("ERROR", `${signalId}: PE hedge order failed. No futures placed`); return;
       }
       // Wait 1.5 seconds for exchange to register the hedge position
       await new Promise(r => setTimeout(r, 1500));
@@ -921,7 +930,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
         console.log(`[HEDGE] PE reversal: ${reversePe.ok ? "OK" : "FAILED"}`);
         if (!reversePe.ok) addLog("ERROR", `CRITICAL: PE reversal failed — manual exit needed for ${peContract.instrument_key}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_fut_failed");
-        addLog("ERROR", `${signalId}: Futures order failed. PE reversed. Check funds.`); return;
+        updateSignalStatus("futures_order_failed._pe_reversed._check_funds."); addLog("ERROR", `${signalId}: Futures order failed. PE reversed. Check funds.`); return;
       }
 
       // Track futures position
@@ -931,7 +940,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       db.prepare("INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active, hedge_id, leg_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
         .run(peContract.instrument_key, "BUY", optQty, peLTP, peLTP, peLTP, Date.now(), JSON.stringify({ hedge_id: hedgeId, hedge_role: "option", option_type: "PE", strike: peContract.strike_price }), legProduct, hedgeId, "option");
 
-      logSignal(rawText.substring(0, 1000), payload, "hedge_placed");
+      updateSignalStatus("hedge_placed"); logSignal(rawText.substring(0, 1000), payload, "hedge_placed");
       logOrder("hedge", "BUY", futResult.instrument_key, futQty, futOrder.data, true);
       logOrder("hedge", "BUY", peContract.instrument_key, optQty, peOrder.data, true);
       addLog("INFO", `buy_ce hedge: BUY ${futQty} futures @ ${futLTP} + BUY ${optQty} PE @ ${peLTP} (strike ${peContract.strike_price}), hedge_id=${hedgeId}`);
@@ -939,7 +948,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
     } catch (e) {
       console.error("[HEDGE] buy_ce error:", e.message);
       logSignal(rawText.substring(0, 1000), payload, "hedge_error");
-      addLog("ERROR", `${signalId}: Hedge error: ${e.message}`); return;
+      updateSignalStatus("hedge_error:_e.message"); addLog("ERROR", `${signalId}: Hedge error: ${e.message}`); return;
     }
   }
 
@@ -951,22 +960,22 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       const futPos = db.prepare("SELECT * FROM positions WHERE active = 1 AND leg_type = 'futures' AND json_extract(exit_config, '$.direction') = 'long'").all();
       if (futPos.length === 0) {
         logSignal(rawText.substring(0, 1000), payload, "sell_rejected_no_futures");
-        addLog("WARN", `${signalId}: No active long futures to exit`); return;
+        updateSignalStatus("no_active_long_futures_to_exit"); addLog("WARN", `${signalId}: No active long futures to exit`); return;
       }
       const pos = futPos[0];
       const exitResult = await placeExitOrder(token, pos.instrument_token, pos.quantity, "SELL", pos.product || "D");
       if (exitResult.ok) {
         db.prepare("UPDATE positions SET active = 0 WHERE id = ?").run(pos.id);
-        logSignal(rawText.substring(0, 1000), payload, "futures_exited");
+        updateSignalStatus("futures_exited"); logSignal(rawText.substring(0, 1000), payload, "futures_exited");
         logOrder("hedge_exit", "SELL", pos.instrument_token, pos.quantity, exitResult.data, true);
         addLog("INFO", `sell_ce: Closed futures ${pos.instrument_token} qty ${pos.quantity}. Option stays for manual exit.`);
         addLog("INFO", `${signalId}: ✅ sell_ce — futures closed. Option stays for manual exit.`); return;
       }
       logSignal(rawText.substring(0, 1000), payload, "futures_exit_failed");
-      addLog("ERROR", `${signalId}: Failed to exit futures`); return;
+      updateSignalStatus("failed_to_exit_futures"); addLog("ERROR", `${signalId}: Failed to exit futures`); return;
     } catch (e) {
       console.error("[HEDGE] sell_ce error:", e.message);
-      addLog("ERROR", `${signalId}: Exit error: ${e.message}`); return;
+      updateSignalStatus("exit_error:_e.message"); addLog("ERROR", `${signalId}: Exit error: ${e.message}`); return;
     }
   }
 
@@ -982,7 +991,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       ]);
       if (!futResult || !spotResult) {
         logSignal(rawText.substring(0, 1000), payload, "hedge_setup_failed");
-        addLog("ERROR", `${signalId}: Could not find futures contract or fetch spot`); return;
+        updateSignalStatus("could_not_find_futures_contract_or_fetch_spot"); addLog("ERROR", `${signalId}: Could not find futures contract or fetch spot`); return;
       }
       const symbol = tcfg.underlying_name || "NIFTY";
       const strikeInterval = symbol.includes("BANK") ? 100 : 50;
@@ -990,10 +999,10 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       const ceStrike = atmStrike + (strikeOffset * strikeInterval);
       console.log(`[HEDGE] Spot: ${spotResult}, ATM: ${atmStrike}, OTM CE strike: ${ceStrike}`);
       const optResult = await getOptionContracts(token, tcfg.underlying, null);
-      if (!optResult.ok) { addLog("ERROR", `${signalId}: Could not fetch option contracts`); return; }
+      if (!optResult.ok) { updateSignalStatus("could_not_fetch_option_contracts"); addLog("ERROR", `${signalId}: Could not fetch option contracts`); return; }
       const allContracts = (optResult.data && optResult.data.data) || [];
       const expiries = [...new Set(allContracts.map(x => x.expiry))].sort();
-      if (expiries.length === 0) { addLog("ERROR", `${signalId}: No option expiries`); return; }
+      if (expiries.length === 0) { updateSignalStatus("no_option_expiries"); addLog("ERROR", `${signalId}: No option expiries`); return; }
       const nearestExpiry = expiries[0];
       let ceContract = allContracts.find(x => x.expiry === nearestExpiry && x.instrument_type === "CE" && x.strike_price === ceStrike);
       if (!ceContract) {
@@ -1006,7 +1015,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       const optQty = parseInt(tcfg.lots || 1, 10) * parseInt(tcfg.lot_size || 65, 10);
       const legProduct = tcfg.product || "D";
       const [ceLTP, futLTP] = await Promise.all([getLTP(token, ceContract.instrument_key), getLTP(token, futResult.instrument_key)]);
-      if (!ceLTP || !futLTP) { addLog("ERROR", `${signalId}: Could not fetch LTP for hedge legs`); return; }
+      if (!ceLTP || !futLTP) { updateSignalStatus("could_not_fetch_ltp_for_hedge_legs"); addLog("ERROR", `${signalId}: Could not fetch LTP for hedge legs`); return; }
 
       const [marginInfo, funds] = await Promise.all([
         getBasketMargin(token, [
@@ -1020,7 +1029,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
         console.log(`[HEDGE] INSUFFICIENT FUNDS: need ${marginInfo.final_margin}, have ${funds.available_margin}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_insufficient_funds");
         addLog("ERROR", `Hedge rejected: need ${marginInfo.final_margin}, have ${funds.available_margin}. Add ${shortfall}.`);
-        addLog("ERROR", `${signalId}: Insufficient funds — need ${marginInfo.final_margin}, have ${funds.available_margin}, add ${shortfall}`); return;
+        updateSignalStatus("insufficient_funds_—_need_margininfo.final_margin,"); addLog("ERROR", `${signalId}: Insufficient funds — need ${marginInfo.final_margin}, have ${funds.available_margin}, add ${shortfall}`); return;
       }
       if (marginInfo) {
         console.log(`[HEDGE] Margin: required=${marginInfo.required_margin}, final=${marginInfo.final_margin} (benefit: ${marginInfo.benefit})`);
@@ -1033,7 +1042,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       console.log(`[HEDGE] CE order: ${ceOrder.ok ? "OK" : "FAILED"}`);
       if (!ceOrder.ok) {
         logSignal(rawText.substring(0, 1000), payload, "hedge_ce_failed");
-        addLog("ERROR", `${signalId}: CE hedge order failed. No futures placed`); return;
+        updateSignalStatus("ce_hedge_order_failed._no_futures_placed"); addLog("ERROR", `${signalId}: CE hedge order failed. No futures placed`); return;
       }
       await new Promise(r => setTimeout(r, 1500));
       console.log("[HEDGE] Step 2: Placing futures order (with hedge margin benefit)...");
@@ -1044,7 +1053,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
         const reverseCe = await placeExitOrder(token, ceContract.instrument_key, optQty, "SELL", legProduct);
         if (!reverseCe.ok) addLog("ERROR", `CRITICAL: CE reversal failed — manual exit needed for ${ceContract.instrument_key}`);
         logSignal(rawText.substring(0, 1000), payload, "hedge_fut_failed");
-        addLog("ERROR", `${signalId}: Futures order failed. CE reversed. Check funds.`); return;
+        updateSignalStatus("futures_order_failed._ce_reversed._check_funds."); addLog("ERROR", `${signalId}: Futures order failed. CE reversed. Check funds.`); return;
       }
 
       db.prepare("INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active, hedge_id, leg_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
@@ -1052,7 +1061,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       db.prepare("INSERT INTO positions (instrument_token, transaction_type, quantity, entry_price, highest_price, lowest_price, added_at, exit_config, product, active, hedge_id, leg_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)")
         .run(ceContract.instrument_key, "BUY", optQty, ceLTP, ceLTP, ceLTP, Date.now(), JSON.stringify({ hedge_id: hedgeId, hedge_role: "option", option_type: "CE", strike: ceContract.strike_price }), legProduct, hedgeId, "option");
 
-      logSignal(rawText.substring(0, 1000), payload, "hedge_placed");
+      updateSignalStatus("hedge_placed"); logSignal(rawText.substring(0, 1000), payload, "hedge_placed");
       logOrder("hedge", "SELL", futResult.instrument_key, futQty, futOrder.data, true);
       logOrder("hedge", "BUY", ceContract.instrument_key, optQty, ceOrder.data, true);
       addLog("INFO", `buy_pe hedge: SELL ${futQty} futures @ ${futLTP} + BUY ${optQty} CE @ ${ceLTP} (strike ${ceContract.strike_price}), hedge_id=${hedgeId}`);
@@ -1060,7 +1069,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
     } catch (e) {
       console.error("[HEDGE] buy_pe error:", e.message);
       logSignal(rawText.substring(0, 1000), payload, "hedge_error");
-      addLog("ERROR", `${signalId}: Hedge error: ${e.message}`); return;
+      updateSignalStatus("hedge_error:_e.message"); addLog("ERROR", `${signalId}: Hedge error: ${e.message}`); return;
     }
   }
 
@@ -1072,22 +1081,22 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
       const futPos = db.prepare("SELECT * FROM positions WHERE active = 1 AND leg_type = 'futures' AND json_extract(exit_config, '$.direction') = 'short'").all();
       if (futPos.length === 0) {
         logSignal(rawText.substring(0, 1000), payload, "sell_rejected_no_futures");
-        addLog("WARN", `${signalId}: No active short futures to exit`); return;
+        updateSignalStatus("no_active_short_futures_to_exit"); addLog("WARN", `${signalId}: No active short futures to exit`); return;
       }
       const pos = futPos[0];
       const exitResult = await placeExitOrder(token, pos.instrument_token, pos.quantity, "BUY", pos.product || "D");
       if (exitResult.ok) {
         db.prepare("UPDATE positions SET active = 0 WHERE id = ?").run(pos.id);
-        logSignal(rawText.substring(0, 1000), payload, "futures_exited");
+        updateSignalStatus("futures_exited"); logSignal(rawText.substring(0, 1000), payload, "futures_exited");
         logOrder("hedge_exit", "BUY", pos.instrument_token, pos.quantity, exitResult.data, true);
         addLog("INFO", `sell_pe: Closed short futures ${pos.instrument_token} qty ${pos.quantity}. Option stays for manual exit.`);
         addLog("INFO", `${signalId}: ✅ sell_pe — short futures closed. Option stays for manual exit.`); return;
       }
       logSignal(rawText.substring(0, 1000), payload, "futures_exit_failed");
-      addLog("ERROR", `${signalId}: Failed to exit futures`); return;
+      updateSignalStatus("failed_to_exit_futures"); addLog("ERROR", `${signalId}: Failed to exit futures`); return;
     } catch (e) {
       console.error("[HEDGE] sell_pe error:", e.message);
-      addLog("ERROR", `${signalId}: Exit error: ${e.message}`); return;
+      updateSignalStatus("exit_error:_e.message"); addLog("ERROR", `${signalId}: Exit error: ${e.message}`); return;
     }
   }
 
@@ -1097,7 +1106,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
   // Auto Trade (option-only) check — if futures hedge is OFF, auto must be ON
   if (forcedOptionType && !tcfg.futures_enabled && !tcfg.auto_enabled) {
     logSignal(rawText.substring(0, 1000), payload, "rejected_both_off");
-    addLog("WARN", `${signalId}: Both Auto Trade and Futures Hedge are OFF`); return;
+    updateSignalStatus("both_auto_trade_and_futures_hedge_are_off"); addLog("WARN", `${signalId}: Both Auto Trade and Futures Hedge are OFF`); return;
   }
   const payloadInstrument = payload.instrument_token || payload.ticker || payload.symbol || payload.instrument_key || "";
   let instrumentToken, quantity, entryPrice;
@@ -1124,7 +1133,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
     const atm = await calculateATM(token, tcfg2.underlying, legOptionType, null);
     if (!atm) {
       logSignal(rawText.substring(0, 1000), payload, "atm_calc_failed");
-      addLog("ERROR", `${signalId}: Failed to calculate ATM strike`); return;
+      updateSignalStatus("failed_to_calculate_atm_strike"); addLog("ERROR", `${signalId}: Failed to calculate ATM strike`); return;
     }
     instrumentToken = atm.instrument_key;
     quantity = parseInt(legLots, 10) * parseInt(tcfg2.lot_size, 10);
@@ -1153,7 +1162,7 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
     if (!matchingPosition) {
       console.log("[WEBHOOK] SELL rejected — no open BUY position to exit");
       logSignal(rawText.substring(0, 1000), payload, "sell_rejected_no_position");
-      addLog("WARN", `${signalId}: No open position to exit`); return;
+      updateSignalStatus("no_open_position_to_exit"); addLog("WARN", `${signalId}: No open position to exit`); return;
     }
     if (!payloadInstrument) {
       instrumentToken = matchingPosition.instrument_token;
@@ -1169,10 +1178,10 @@ async function processSignalInBackground(signalId, rawText, payload, action, for
     });
   } catch (err) {
     logSignal(rawText.substring(0, 1000), payload, "order_api_error");
-    addLog("ERROR", `${signalId}: Upstox API failed: ${err.message}`); return;
+    updateSignalStatus("upstox_api_failed:_err.message"); addLog("ERROR", `${signalId}: Upstox API failed: ${err.message}`); return;
   }
 
-  logSignal(rawText.substring(0, 1000), payload, result.ok ? "order_placed" : "order_failed");
+  updateSignalStatus(result.ok ? "order_placed" : "order_failed"); logSignal(rawText.substring(0, 1000), payload, result.ok ? "order_placed" : "order_failed");
   logOrder(action === "SELL" ? "exit" : "entry", action, instrumentToken, quantity, result.data, result.ok);
   if (result.ok) { addLog("INFO", `${signalId}: ✅ Order placed — ${action} ${quantity} ${instrumentToken}`); } else { addLog("ERROR", `${signalId}: ❌ Order failed — ${JSON.stringify(result.data).substring(0, 200)}`); }
 

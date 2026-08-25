@@ -676,9 +676,9 @@ function isDuplicate(payload) {
   // (timestamps, prices) that make identical alerts look different.
   const action = String(payload.action || payload.side || payload.signal || "").toUpperCase().trim();
   const key = action;  // e.g. "BUY_CE" — two buy_ce alerts within 5s = duplicate
-  if (recentSignals.has(key)) return true;
-  recentSignals.set(key, true);
-  setTimeout(() => recentSignals.delete(key), 5000);
+  if (recentSignals.has(key)) { console.log(`[DEDUP] Duplicate ${key} blocked (within 15s window)`); return true; }
+  recentSignals.set(key, true); console.log(`[DEDUP] ${key} registered — duplicates blocked for 15s`);
+  setTimeout(() => recentSignals.delete(key), 15000);
   return false;
 }
 

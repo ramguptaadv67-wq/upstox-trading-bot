@@ -1549,7 +1549,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 </head>
 <body>
 <h1>🐎 Horse Engine <span style="font-size:0.5em;color:var(--green);vertical-align:middle;">● LIVE</span></h1>
-<p class="subtitle">VPS Edition v30</p>
+<p class="subtitle">VPS Edition v32</p>
 <div id="killBanner" class="hidden killed-banner">⚠ BOT OFF — all incoming signals are blocked</div>
   </div>
 
@@ -1640,7 +1640,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   <p class="muted" style="margin-bottom:12px;">When a TradingView webhook sends <code>{"action":"buy_ce"}</code> or <code>{"action":"buy_pe"}</code>, the bot uses these settings to auto-select ATM strike, quantity, and exit conditions for each leg independently.</p>
   <div class="form-row">
     <div style="flex:2"><label>1. Underlying</label><select id="tcUnderlying" onchange="onTcInstrumentChange()"></select></div>
-    <div><label>Lot Size (manual)</label><input id="tcLotSize" type="number" value="65" min="1" onchange="updateTcQty()" style="font-weight:600;"></div>
+    <div><label>Lot Size (manual)</label><div style="display:flex;gap:6px;"><input id="tcLotSize" type="number" value="65" min="1" onchange="updateTcQty()" style="font-weight:600;flex:1;"><button class="btn btn-primary" onclick="saveTradingConfig()" style="padding:8px 12px;white-space:nowrap;">💾 Save</button></div></div>
     <div><label>CE Qty</label><input id="tcCeQty" type="number" readonly style="opacity:.6"></div>
     <div><label>PE Qty</label><input id="tcPeQty" type="number" readonly style="opacity:.6"></div>
   </div>
@@ -1652,7 +1652,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
         <label class="toggle"><input type="checkbox" id="tcCeEnabled" checked onchange="updateLights()"><span class="slider"></span></label><span class="tlight on" id="ceLight"></span>
         <span style="margin-left:8px;font-weight:600;">Enable CE leg</span>
       </div>
-      <div><label>Lots</label><input id="tcCeLots" type="number" value="1" min="1"></div>
+      <div><label>Lots</label><input id="tcCeLots" type="number" value="1" min="1" onchange="updateTcQty();saveTradingConfig()"></div>
       <div style="margin-top:6px;"><label>Product</label><select id="tcCeProduct"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
       
     </div>
@@ -1664,12 +1664,17 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
       </div>
   
 
-      <div><label>Lots</label><input id="tcPeLots" type="number" value="1" min="1"></div>
+      <div><label>Lots</label><input id="tcPeLots" type="number" value="1" min="1" onchange="updateTcQty();saveTradingConfig()"></div>
       <div style="margin-top:6px;"><label>Product</label><select id="tcPeProduct"><option value="D">D (Delivery)</option><option value="I">I (Intraday)</option></select></div>
       
     </div>
 
 
+  </div>
+
+  <div style="text-align:center;margin:14px 0 4px 0;">
+    <button class="btn btn-primary" onclick="saveTradingConfig()" style="padding:10px 28px;font-size:0.95rem;font-weight:600;">💾 Save Configuration</button>
+    <p class="muted" style="font-size:0.7rem;margin-top:6px;">Saves lot size, lots, products, and CE/PE leg settings. Saved values reload automatically after refresh.</p>
   </div>
 
   <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">TradingView Webhook Setup</h2>
@@ -1769,7 +1774,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   <div class="form-row" style="align-items:center;margin-bottom:12px;">
     <div style="flex:1;">
       <label>Number of lots (futures + option)</label>
-      <select id="tcHedgeLots" style="font-size:1rem;padding:8px;">
+      <select id="tcHedgeLots" style="font-size:1rem;padding:8px;" onchange="saveTradingConfig()">
         <option value="1" selected>1 lot (65 qty NIFTY)</option>
         <option value="2">2 lots (130 qty NIFTY)</option>
         <option value="3">3 lots (195 qty NIFTY)</option>
@@ -1787,7 +1792,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   <div class="form-row" style="align-items:center;margin-bottom:12px;">
     <div style="flex:1;">
       <label>Strike distance from ATM (for protective option)</label>
-      <select id="tcStrikeOffset" style="font-size:1rem;padding:8px;">
+      <select id="tcStrikeOffset" style="font-size:1rem;padding:8px;" onchange="saveTradingConfig()">
         <option value="1">1 strike from ATM — costliest option, max protection</option>
         <option value="2" selected>2 strikes from ATM</option>
         <option value="3">3 strikes from ATM</option>
@@ -1800,6 +1805,11 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
     </div>
   </div>
   <p class="muted" style="font-size:0.75rem;margin-bottom:12px;">NIFTY strike interval = 50pts. Offset 3 = 150pts away from ATM.<br>Lower offset = more protection but costlier option. Higher offset = cheaper option, less protection.<br>You can also override per-signal: <code>{"action":"buy_ce","strike_offset":4}</code></p>
+
+  <div style="text-align:center;margin:14px 0 4px 0;">
+    <button class="btn btn-primary" onclick="saveTradingConfig()" style="padding:10px 28px;font-size:0.95rem;font-weight:600;">💾 Save Configuration</button>
+    <p class="muted" style="font-size:0.7rem;margin-top:6px;">Saves lot count + strike offset (auto-saves on change too)</p>
+  </div>
 
   <div class="section-divider"></div>
   <h2 style="font-size:0.95rem;color:#8b949e;margin-bottom:8px;">Webhook Alert Messages</h2>

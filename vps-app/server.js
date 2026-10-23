@@ -20,14 +20,14 @@ app.use((req, res, next) => {
 // --- Dashboard authentication ---
 function dashAuth(req, res, next) {
   // Skip auth for webhook (has its own token auth) and notifier
-  if (req.path === "/webhook" || req.path === "/notifier") return next();
+  if (req.path === "/webhook" || req.path === "/notifier" || req.path === "/health") return next();
   // Check if password is set
   const dashPass = getSetting("DASHBOARD_PASSWORD", "");
   if (!dashPass) return next(); // No password set = open (user can set one in Settings)
   // Check session cookie
   const cookie = req.headers.cookie || "";
   const match = cookie.match(/dash_auth=([^;]+)/);
-  if (match && match[1] === dashPass) return next();
+  if (match && decodeURIComponent(match[1]) === dashPass) return next();
   // Check bearer token
   const auth = req.headers.authorization || "";
   if (auth.startsWith("Bearer ") && auth.substring(7) === dashPass) return next();
@@ -36,7 +36,7 @@ function dashAuth(req, res, next) {
     return res.status(401).json({ error: "Authentication required. Set DASHBOARD_PASSWORD." });
   }
   // Show login page for HTML requests
-  res.send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Horse Engine — Login</title><style>body{background:#0d1117;color:#e6edf3;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}form{text-align:center}input{padding:12px;width:200px;background:#161b22;border:1px solid #30363d;color:#e6edf3;border-radius:6px;font-size:16px}button{padding:12px 20px;margin-top:8px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:16px;cursor:pointer}h1{color:#58a6ff;margin-bottom:20px}a{color:#58a6ff;font-size:12px}</style></head><body><form onsubmit="let p=document.getElementById('pw').value;document.cookie='dash_auth='+p+';path=/;max-age=86400';location.reload()"><h1>🐎 Horse Engine</h1><input type="password" id="pw" placeholder="Enter password" autofocus><br><button type="submit">Login</button></form></body></html>`);
+  res.send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Horse Engine — Login</title><style>body{background:#0d1117;color:#e6edf3;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}form{text-align:center}input{padding:12px;width:200px;background:#161b22;border:1px solid #30363d;color:#e6edf3;border-radius:6px;font-size:16px}button{padding:12px 20px;margin-top:8px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:16px;cursor:pointer}h1{color:#58a6ff;margin-bottom:20px}a{color:#58a6ff;font-size:12px}</style></head><body><form onsubmit="let p=document.getElementById('pw').value;document.cookie='dash_auth='+encodeURIComponent(p)+';path=/;max-age=86400';location.reload()"><h1>🐎 Horse Engine</h1><input type="password" id="pw" placeholder="Enter password" autofocus><br><button type="submit">Login</button></form></body></html>`);
 }
 
 
@@ -63,6 +63,9 @@ function fetchIPv4(url, opts = {}) {
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.text({ limit: "1mb" }));
+
+// --- Dashboard password protection (skips /webhook, /notifier, /health) ---
+app.use(dashAuth);
 
 // No-cache for all API responses — prevents browser from serving stale data
 app.use("/api", (req, res, next) => {
@@ -1403,6 +1406,7 @@ app.get("/api/settings", (req, res) => {
     has_webhook_secret: !!getSetting("WEBHOOK_SECRET"),
     has_client_id: !!getSetting("UPSTOX_CLIENT_ID"),
     has_client_secret: !!getSetting("UPSTOX_CLIENT_SECRET"),
+    has_dash_pass: !!getSetting("DASHBOARD_PASSWORD"),
   });
 });
 
@@ -1410,7 +1414,7 @@ app.post("/api/settings", (req, res) => {
   if (req.body.upstox_client_id) setSetting("UPSTOX_CLIENT_ID", req.body.upstox_client_id);
   if (req.body.upstox_client_secret) setSetting("UPSTOX_CLIENT_SECRET", req.body.upstox_client_secret);
   if (req.body.webhook_secret) setSetting("WEBHOOK_SECRET", req.body.webhook_secret);
-    if (req.body.dash_pass) setSetting("DASHBOARD_PASSWORD", req.body.dash_pass);
+    if (req.body.dash_pass !== undefined) setSetting("DASHBOARD_PASSWORD", String(req.body.dash_pass));
   _optionContractsCache = {};
   console.log(`[SETTINGS] Settings saved, caches cleared`);
   res.json({ status: "saved" });
@@ -1549,7 +1553,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
 </head>
 <body>
 <h1>🐎 Horse Engine <span style="font-size:0.5em;color:var(--green);vertical-align:middle;">● LIVE</span></h1>
-<p class="subtitle">VPS Edition v33</p>
+<p class="subtitle">VPS Edition v34</p>
 <div id="killBanner" class="hidden killed-banner">⚠ BOT OFF — all incoming signals are blocked</div>
   </div>
 
@@ -1838,6 +1842,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border)}
   <div class="form-row">
     <div style="flex:2"><label>Dashboard Password (optional)</label><input id="setDashPass" type="password" placeholder="Set password to protect dashboard"></div>
   </div>
+  <div style="margin:-4px 0 10px;"><button class="btn btn-secondary" onclick="removeDashPass()" style="font-size:0.8rem;">🔓 Remove Password Protection</button> <span class="muted" style="font-size:0.72rem;">Clears the saved password</span></div>
   <div class="form-row">
     <div style="flex:2"><label>Webhook Secret</label><input id="setWebhookSecret" type="password" placeholder="Enter new webhook secret"></div>
   </div>
@@ -2052,8 +2057,9 @@ async function loadOrders(){const d=await api('/api/orders');const b=document.ge
 async function loadPositions(){const d=await api('/api/positions');const b=document.getElementById('positionsBody');if(!d||d.length===0){b.innerHTML='<tr><td colspan="6" class="muted">No positions</td></tr>';return;}b.innerHTML=d.map(p=>'<tr><td>'+(p.instrument_token||'').substring(0,25)+'</td><td><span class="pill '+(p.transaction_type==='BUY'?'buy':'sell')+'">'+p.transaction_type+'</span></td><td>'+p.quantity+'</td><td>'+p.entry_price+'</td><td>'+(p.highest_price||p.lowest_price||'—')+'</td><td><button class="btn btn-danger" style="padding:4px 12px;font-size:0.8rem;" onclick="exitPosition('+p.id+')">Exit</button></td></tr>').join('');}
 async function loadUpstoxPositions(){const r=await api('/api/upstox-positions');const b=document.getElementById('positionsBody');if(r.error){b.innerHTML='<tr><td colspan="6" class="muted">Error: '+r.error+'</td></tr>';return;}const ps=(r.data&&r.data.data)||[];if(ps.length===0){b.innerHTML='<tr><td colspan="6" class="muted">No live positions</td></tr>';return;}b.innerHTML=ps.map(p=>'<tr><td>'+(p.instrument_token||'').substring(0,25)+'</td><td><span class="pill '+(p.transaction_type==='BUY'?'buy':'sell')+'">'+(p.transaction_type||'')+'</span></td><td>'+p.quantity+'</td><td>'+p.average_price+'</td><td>'+p.last_price+'</td><td>—</td></tr>').join('');}
 async function exitPosition(id){if(!confirm('Exit this position now? This places a MARKET order.'))return;try{const r=await api('/api/exit-position',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});if(r.ok){toast('✅ Exit order placed!');loadPositions();}else{toast('❌ Exit failed: '+(r.error||'unknown'));}}catch(e){toast('❌ Error: '+e.message);}}
-async function loadSettings(){const s=await api('/api/settings');document.getElementById('setClientId').value=s.upstox_client_id||'';document.getElementById('setClientSecret').value='';document.getElementById('setWebhookSecret').value='';let p=[];p.push(s.has_client_id?'✅ API Key':'❌ API Key');p.push(s.has_client_secret?'✅ Secret':'❌ Secret');p.push(s.has_webhook_secret?'✅ Webhook':'❌ Webhook');document.getElementById('settingsStatus').innerHTML=p.join(' &nbsp; ');}
-async function saveSettings(){const b={};const ci=document.getElementById('setClientId').value.trim(),cs=document.getElementById('setClientSecret').value.trim(),ws=document.getElementById('setWebhookSecret').value.trim();if(ci)b.upstox_client_id=ci;if(cs)b.upstox_client_secret=cs;if(ws)b.webhook_secret=ws;if(!ci&&!cs&&!ws){toast('No changes');return;}await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});toast('✅ Saved!');loadSettings();loadStatus();}
+async function loadSettings(){const s=await api('/api/settings');document.getElementById('setClientId').value=s.upstox_client_id||'';document.getElementById('setClientSecret').value='';document.getElementById('setWebhookSecret').value='';document.getElementById('setDashPass').value='';let p=[];p.push(s.has_client_id?'✅ API Key':'❌ API Key');p.push(s.has_client_secret?'✅ Secret':'❌ Secret');p.push(s.has_webhook_secret?'✅ Webhook':'❌ Webhook');p.push(s.has_dash_pass?'🔒 Password ON':'🔓 No Password');document.getElementById('settingsStatus').innerHTML=p.join(' &nbsp; ');}
+async function removeDashPass(){if(!confirm('Remove dashboard password? The dashboard will be open to anyone with the URL.'))return;await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dash_pass:''})});toast('🔓 Password removed');loadSettings();}
+async function saveSettings(){const b={};const ci=document.getElementById('setClientId').value.trim(),cs=document.getElementById('setClientSecret').value.trim(),ws=document.getElementById('setWebhookSecret').value.trim(),dp=document.getElementById('setDashPass').value.trim();if(ci)b.upstox_client_id=ci;if(cs)b.upstox_client_secret=cs;if(ws)b.webhook_secret=ws;if(dp)b.dash_pass=dp;if(!ci&&!cs&&!ws&&!dp){toast('No changes');return;}await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});toast(dp?'✅ Saved! Password protection is now ON — you will be asked to log in.':'✅ Saved!');loadSettings();loadStatus();}
 async function loadBacktestStrats(){try{const c=await api('/api/strategy-config');const strats=await api('/api/strategies');const sel=document.getElementById('btStrategy');sel.innerHTML='';for(const[key,val]of Object.entries(strats.strategies||{})){sel.innerHTML+='<option value="'+key+'">'+val.name+'</option>';}if(c.strategy)sel.value=c.strategy;sel.disabled=false;}catch(e){console.error('loadBacktestStrats error:',e);}}
 async function runBacktest(){const st=document.getElementById('btStatus');const sm=document.getElementById('btSummary');const rs=document.getElementById('btResults');const btn=event.target;btn.disabled=true;st.textContent='Running backtest...';sm.style.display='none';rs.innerHTML='';try{const interval=document.getElementById('btInterval').value;const r=await api('/api/strategy-backtest?interval='+interval);if(r.error){st.textContent='Error: '+r.error;btn.disabled=false;return;}st.textContent='Backtest complete — '+r.total_trades+' trades on '+r.candle_count+' candles ('+r.interval+')';sm.style.display='block';sm.innerHTML='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin-bottom:12px;">'+'<div class="card" style="text-align:center;padding:8px;"><div class="muted" style="font-size:0.7rem;">Trades</div><div style="font-size:1.2rem;font-weight:bold;">'+r.total_trades+'</div></div>'+'<div class="card" style="text-align:center;padding:8px;"><div class="muted" style="font-size:0.7rem;">Win Rate</div><div style="font-size:1.2rem;font-weight:bold;color:'+(parseFloat(r.win_rate)>=50?'var(--green)':'var(--red)')+';">'+r.win_rate+'%</div></div>'+'<div class="card" style="text-align:center;padding:8px;"><div class="muted" style="font-size:0.7rem;">Total P&L</div><div style="font-size:1.2rem;font-weight:bold;color:'+(parseFloat(r.total_pnl)>=0?'var(--green)':'var(--red)')+';">'+(parseFloat(r.total_pnl)>=0?'+':'')+r.total_pnl+'</div></div>'+'<div class="card" style="text-align:center;padding:8px;"><div class="muted" style="font-size:0.7rem;">Avg P&L</div><div style="font-size:1.2rem;font-weight:bold;color:'+(parseFloat(r.avg_pnl)>=0?'var(--green)':'var(--red)')+';">'+(parseFloat(r.avg_pnl)>=0?'+':'')+r.avg_pnl+'</div></div>'+'<div class="card" style="text-align:center;padding:8px;"><div class="muted" style="font-size:0.7rem;">Max Win</div><div style="font-size:1.2rem;font-weight:bold;color:var(--green);">+'+r.max_win+'</div></div>'+'<div class="card" style="text-align:center;padding:8px;"><div class="muted" style="font-size:0.7rem;">Max Loss</div><div style="font-size:1.2rem;font-weight:bold;color:var(--red);">'+r.max_loss+'</div></div>'+'</div>';if(r.trades.length===0){rs.innerHTML='<p class="muted">No trades generated. Try a different interval or adjust strategy params.</p>';btn.disabled=false;return;}let html='<table><thead><tr><th>#</th><th>Type</th><th>Entry</th><th>Exit</th><th>Entry Time</th><th>Exit Time</th><th>P&L (pts)</th></tr></thead><tbody>';for(let i=0;i<r.trades.length;i++){const t=r.trades[i];const pnlColor=t.pnl>0?'var(--green)':t.pnl<0?'var(--red)':'var(--text)';const pnlStr=(t.pnl>0?'+':'')+t.pnl;const noteStr=t.note?' <span class="muted" style="font-size:0.7rem;">('+t.note+')</span>':'';html+='<tr><td>'+(i+1)+'</td><td><span class="pill '+(t.type==='CE'?'buy':'sell')+'">'+t.type+'</span></td><td>'+t.entry_price+'</td><td>'+t.exit_price+'</td><td style="font-size:0.75rem;">'+t.entry_time+'</td><td style="font-size:0.75rem;">'+t.exit_time+'</td><td style="color:'+pnlColor+';font-weight:bold;">'+pnlStr+'</td></tr>';}html+='</tbody></table>';rs.innerHTML=html;}catch(e){st.textContent='Error: '+e.message;}btn.disabled=false;}
 loadStatus();loadInstruments().then(()=>loadTradingConfig());
